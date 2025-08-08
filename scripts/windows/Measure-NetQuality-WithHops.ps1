@@ -101,7 +101,7 @@ function Get-HopsForTarget([string]$target,[int]$maxHops=25) {
     $m = [regex]::Match($line, '(\d{1,3}(?:\.\d{1,3}){3})')  # 行内の最初のIPv4
     if($m.Success){ $ips += $m.Value }
   }
-  Write-Host $ips
+  # Write-Host $ips
   return $ips
 }
 
