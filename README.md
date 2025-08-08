@@ -91,7 +91,7 @@ aa:bb:cc:dd:ee:f0,執務室-西側
 
 ## GitHub への公開手順（例）
 
-1) GitHub で新規リポジトリ（例：`teams-net-quality-tools`）を作成  
+1) GitHub で新規リポジトリ（例：`teams-net-quality-tools`）を作成
 2) ローカルで：
 ```bash
 cd teams-net-quality-tools
