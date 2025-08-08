@@ -1,0 +1,11 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python/venv (por if you add tools later)
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
