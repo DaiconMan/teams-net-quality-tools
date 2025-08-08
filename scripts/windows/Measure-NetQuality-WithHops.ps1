@@ -1,4 +1,4 @@
-# Save as: Measure-NetQuality-WithHops.ps1
+# Measure-NetQuality-WithHops.ps1 (fixed)
 param(
   [string[]]$Targets = @(
     "world.tr.teams.microsoft.com","teams.microsoft.com",
@@ -46,26 +46,26 @@ function Get-WifiContext {
   [pscustomobject]@{ type=$type; ssid=$ssid; bssid=$bssid; signal_pct=$signal }
 }
 
-function Measure-DnsTime($host){
+function Measure-DnsTime([string]$target){
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  try { [System.Net.Dns]::GetHostAddresses($host) | Out-Null } catch {}
+  try { [System.Net.Dns]::GetHostAddresses($target) | Out-Null } catch {}
   $sw.Stop(); [math]::Round($sw.Elapsed.TotalMilliseconds,2)
 }
-function Measure-TcpTime($host,$port=443){
+function Measure-TcpTime([string]$target,[int]$port=443){
   $sw = [System.Diagnostics.Stopwatch]::StartNew(); $note=""
   $client = New-Object System.Net.Sockets.TcpClient
-  try { $client.Connect($host,$port) } catch { $note="tcp_fail" }
+  try { $client.Connect($target,$port) } catch { $note="tcp_fail" }
   $client.Close(); $sw.Stop()
   ,([math]::Round($sw.Elapsed.TotalMilliseconds,2)),$note
 }
-function Measure-HttpHead($host){
-  $uri = "https://$host/"; $sw=[System.Diagnostics.Stopwatch]::StartNew(); $note=""
+function Measure-HttpHead([string]$target){
+  $uri = "https://$target/"; $sw=[System.Diagnostics.Stopwatch]::StartNew(); $note=""
   try { Invoke-WebRequest -Uri $uri -Method Head -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { $note="http_fail" }
   $sw.Stop(); ,([math]::Round($sw.Elapsed.TotalMilliseconds,2)),$note
 }
-function Measure-Icmp($host,$count){
+function Measure-Icmp([string]$target,[int]$count){
   try{
-    $pings = Test-Connection -ComputerName $host -Count $count -ErrorAction Stop
+    $pings = Test-Connection -ComputerName $target -Count $count -ErrorAction Stop
     $sent = $count; $recv = @($pings).Count
     $loss = if ($sent -gt 0) { 100.0 * ($sent - $recv) / $sent } else { 0 }
     $rtts = @(); foreach($p in $pings){ $rtts += $p.ResponseTime }
@@ -95,18 +95,15 @@ function Measure-HopStats([string]$target,[string[]]$hopIps,[int]$count){
   foreach($ip in $hopIps){
     $idx++
     $avg=$null;$jit=$null;$loss=$null;$note=$null
-    $avg,$jit,$loss,$note = Measure-Icmp -host $ip -count $count
+    $avg,$jit,$loss,$note = Measure-Icmp -target $ip -count $count
     [pscustomobject]@{ hop_index=$idx; hop_ip=$ip; avg=$avg; jitter=$jit; loss=$loss; note=$note }
   }
 }
 
+# 状態読み込み
 $prevBssid = $null; $cycle = 0
 if(Test-Path $StateFile){
-  try {
-    $st = Get-Content $StateFile -Raw | ConvertFrom-Json
-    $prevBssid = $st.prev_bssid
-    $cycle = [int]$st.cycle
-  } catch {}
+  try { $st = Get-Content $StateFile -Raw | ConvertFrom-Json; $prevBssid = $st.prev_bssid; $cycle = [int]$st.cycle } catch {}
 }
 
 while($true){
@@ -114,6 +111,7 @@ while($true){
   $ctx = Get-WifiContext
   $apName = Get-ApName $ctx.bssid
 
+  # ローミング検知
   $roamed = ""; $roamFrom = ""; $roamTo = ""
   if($ctx.type -eq "wifi" -and $ctx.bssid){
     if($prevBssid -and ($prevBssid.ToLower() -ne $ctx.bssid.ToLower())){
@@ -121,27 +119,28 @@ while($true){
     }
     $prevBssid = $ctx.bssid
   } else { $prevBssid = $null }
-
   @{ prev_bssid = $prevBssid; cycle = $cycle } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding utf8
 
+  # --- エンドツーエンド ---
   foreach($t in $Targets){
     $dns = Measure-DnsTime $t
     $tcpMs,$tcpNote = Measure-TcpTime $t 443
     $httpMs,$httpNote = Measure-HttpHead $t
     $avg=$null;$jit=$null;$loss=$null;$icmpNote=$null
-    $avg,$jit,$loss,$icmpNote = Measure-Icmp -host $t -count $SamplesPerCycle
+    $avg,$jit,$loss,$icmpNote = Measure-Icmp -target $t -count $SamplesPerCycle
 
     $rtt = if($avg){ [double]$avg } elseif($tcpMs){ [double]$tcpMs } else { 999 }
     $pl  = if($loss){ [double]$loss } else { 0 }
     $mos = [math]::Round([math]::Max(1,[math]::Min(4.5, 4.5 - 0.0004*$rtt - 0.1*$pl)),2)
 
-    $notes = @($icmpNote,$tcpNote,$httpNote,$roamed) | Where-Object { $_ -and $_ -ne "" } -join "+"
+    $notes = (@($icmpNote,$tcpNote,$httpNote,$roamed) | Where-Object { $_ -and $_ -ne "" }) -join '+'
     $line = "{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17}" -f `
       (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $t,$avg,$jit,$loss,$dns,$tcpMs,$httpMs,$mos, `
       $ctx.type,$ctx.ssid,$ctx.bssid,$ctx.signal_pct,$apName,$roamed,$roamFrom,$roamTo,$notes
     Add-Content -Path $OutCsv -Value $line
   }
 
+  # --- ホップ ---
   if( ($cycle % $HopProbeEveryCycles) -eq 0 ){
     foreach($ht in $HopTargets){
       $hops = Get-HopsForTarget -target $ht -maxHops $MaxHops
