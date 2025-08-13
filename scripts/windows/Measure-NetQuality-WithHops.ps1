@@ -37,38 +37,34 @@ function Get-ApName([string]$bssid){
 function Get-WifiContext {
   $ssid=$null; $bssid=$null; $signal=$null; $type="wired_or_disconnected"
 
-  # netsh 蜃ｺ蜉帙ｒ縺昴・縺ｾ縺ｾ蜿門ｾ暦ｼ域枚蟄怜喧縺代＠縺ｫ縺上＞闍ｱ謨ｰ蟄励・縺ｿ縺ｧ謚ｽ蜃ｺ・・
-  $lines = netsh.exe wlan show interfaces 2>$null
-  if ($LASTEXITCODE -eq 0 -and $lines) {
-    # 1) 謗･邯壼愛螳壹・ BSSID 縺ｮ譛臥┌縺ｧ陦後≧・・SSID 縺後≠繧後・謗･邯壻ｸｭ縺ｨ縺ｿ縺ｪ縺呻ｼ・
-    $bidx = $null
-    for($i=0; $i -lt $lines.Count; $i++){
-      if ($lines[$i] -match '^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})'){
-        $bssid = $Matches[1].Replace('-',':').ToLower()
-        $type = "wifi"
-        $bidx = $i
-        break
+  # netsh 出力をセクション（インターフェイス単位）に分解
+  $sections=@()
+  $out = netsh.exe wlan show interfaces 2>$null
+  if ($LASTEXITCODE -eq 0 -and $out) {
+    $buf=@()
+    foreach($ln in $out){
+      if($ln -match "^\s*(Name|名前)\s*:"){   # 新しいIFセクション開始
+        if($buf.Count){ $sections += ,($buf -join "`n"); $buf=@() }
       }
+      $buf += $ln
     }
+    if($buf.Count){ $sections += ,($buf -join "`n") }
 
-    if ($type -eq "wifi") {
-      # 2) 蜷後§繧ｻ繧ｯ繧ｷ繝ｧ繝ｳ蜀・ｼ亥燕蠕・5陦檎ｨ句ｺｦ・峨°繧・SSID 繧貞叙蠕・
-      $start = [Math]::Max(0, $bidx - 15)
-      $end   = [Math]::Min($lines.Count-1, $bidx + 15)
-      for($j=$start; $j -le $end; $j++){
-        if ($null -eq $ssid -and $lines[$j] -match '^\s*SSID\s*:\s*(.+)$') {
-          $ssid = $Matches[1].Trim()
-        }
-        # 3) 繧ｷ繧ｰ繝翫Ν縺ｯ縲・縲阪ｒ蜷ｫ繧譛蛻昴・謨ｰ蛟､% 繧呈鏡縺・ｼ医Λ繝吶Ν縺ｯ險隱樣撼萓晏ｭ假ｼ・
-        if ($null -eq $signal -and $lines[$j] -match ':\s*([0-9]{1,3})\s*%') {
-          $signal = [int]$Matches[1]
-        }
-        if ($ssid -and $signal) { break }
+    foreach($sec in $sections){
+      # 「接続済み」のセクションだけ採用（英/日対応）
+      if($sec -match "(?im)^\s*(State|状態)\s*:\s*(connected|接続されています)"){
+        if($sec -match "(?im)^\s*SSID\s*:\s*(.+)$"){ $ssid = $Matches[1].Trim() }
+        $m = [regex]::Match($sec,"(?im)^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})")
+        if($m.Success){ $bssid = $m.Groups[1].Value.Replace('-',':').ToLower() }
+        $sm = [regex]::Match($sec,"(?im)^\s*(Signal|シグナル)\s*:\s*([0-9]{1,3})%")
+        if($sm.Success){ $signal = [int]$sm.Groups[2].Value }
+        $type = "wifi"
+        break
       }
     }
   }
 
-  # 繝輔か繝ｼ繝ｫ繝舌ャ繧ｯ・夂┌邱唔F縺袈p縺ｪ繧・type=wifi 縺ｫ・・SID/BSSID荳肴・縺ｧ繧ゑｼ・
+  # フォールバック：netshパースに失敗しても、無線IFがUpなら wifi と判定
   if($type -ne "wifi"){
     try{
       $wifi = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
@@ -79,6 +75,7 @@ function Get-WifiContext {
 
   [pscustomobject]@{ type=$type; ssid=$ssid; bssid=$bssid; signal_pct=$signal }
 }
+
 
 function Measure-DnsTime([string]$target){
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -124,14 +121,14 @@ function Measure-Icmp([string]$target,[int]$count){
 }
 
 function Get-HopsForTarget([string]$target,[int]$maxHops=25) {
-  # IPv4蠑ｷ蛻ｶ・・4・会ｼ矩・ｼ輔″OFF・・d・会ｼ九ち繧､繝繧｢繧ｦ繝育洒繧・
+  # IPv4強制（-4）＋逆引きOFF（-d）＋タイムアウト短め
   # Write-Host $target
   $out = tracert.exe -4 -d -h $maxHops -w 800 $target 2>$null
   if(-not $out){ return @() }
   $ips = @()
   foreach($line in $out){
-    if($line -notmatch '^\s*\d+\s') { continue }            # hop逡ｪ蜿ｷ縺ｧ蟋九∪繧玖｡後・縺ｿ
-    $m = [regex]::Match($line, '(\d{1,3}(?:\.\d{1,3}){3})')  # 陦悟・縺ｮ譛蛻昴・IPv4
+    if($line -notmatch '^\s*\d+\s') { continue }            # hop番号で始まる行のみ
+    $m = [regex]::Match($line, '(\d{1,3}(?:\.\d{1,3}){3})')  # 行内の最初のIPv4
     if($m.Success){ $ips += $m.Value }
   }
   # Write-Host $ips
@@ -148,13 +145,13 @@ function Measure-HopStats([string]$target,[string[]]$hopIps,[int]$count){
   }
 }
 
-# --- CSV繝ｭ繝・け蟇ｾ遲厄ｼ夂ｰ｡譏薙・蝣・欧迚・---
+# --- CSVロック対策：簡易・堅牢版 ---
 function Append-Line {
   param([string]$Path,[string]$Line)
   try {
     Add-Content -Path $Path -Value $Line -ErrorAction Stop
   } catch [System.IO.IOException] {
-    # 譛ｬ菴薙′繝ｭ繝・け荳ｭ・・xcel髢九″縺｣縺ｱ縺ｪ縺礼ｭ会ｼ峨・ .queue 縺ｫ騾驕ｿ
+    # 本体がロック中（Excel開きっぱなし等）は .queue に退避
     Add-Content -Path ($Path + ".queue") -Value $Line
   }
 }
@@ -164,17 +161,17 @@ function Flush-Queue {
   $q = $Path + ".queue"
   if (Test-Path $q) {
     try {
-      # 騾驕ｿ蛻・ｒ荳豌励↓蜷域ｵ・
+      # 退避分を一気に合流
       Get-Content $q -ErrorAction Stop | Add-Content -Path $Path -ErrorAction Stop
       Remove-Item $q -Force
     } catch {
-      # 縺ｾ縺繝ｭ繝・け荳ｭ縺ｪ繧画ｬ｡繧ｵ繧､繧ｯ繝ｫ縺ｧ蜀肴倦謌ｦ
+      # まだロック中なら次サイクルで再挑戦
     }
   }
 }
 # -----------------------------------------------------------------------
 
-# 迥ｶ諷玖ｪｭ縺ｿ霎ｼ縺ｿ
+# 状態読み込み
 $prevBssid = $null; $cycle = 0
 if(Test-Path $StateFile){
   try { $st = Get-Content $StateFile -Raw | ConvertFrom-Json; $prevBssid = $st.prev_bssid; $cycle = [int]$st.cycle } catch {}
@@ -185,7 +182,7 @@ while($true){
   $ctx = Get-WifiContext
   $apName = Get-ApName $ctx.bssid
 
-  # 繝ｭ繝ｼ繝溘Φ繧ｰ讀懃衍
+  # ローミング検知
   $roamed = ""; $roamFrom = ""; $roamTo = ""
   if($ctx.type -eq "wifi" -and $ctx.bssid){
     if($prevBssid -and ($prevBssid.ToLower() -ne $ctx.bssid.ToLower())){
@@ -196,7 +193,7 @@ while($true){
 
   @{ prev_bssid = $prevBssid; cycle = $cycle } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding utf8
 
-  # --- 繧ｨ繝ｳ繝峨ヤ繝ｼ繧ｨ繝ｳ繝・---
+  # --- エンドツーエンド ---
   foreach($t in $Targets){
     $dns = Measure-DnsTime $t
     $tcpMs,$tcpNote = Measure-TcpTime $t 443
@@ -204,7 +201,7 @@ while($true){
     $avg=$null;$jit=$null;$loss=$null;$icmpNote=$null
     $avg,$jit,$loss,$icmpNote = Measure-Icmp -target $t -count $SamplesPerCycle
 
-    # 螳牙・縺ｫ謨ｰ蛟､蛹・
+    # 安全に数値化
     $rtt = 999.0
     if($null -ne $avg -and -not ($avg -is [System.Array])) { $rtt = [double]$avg }
     elseif($null -ne $tcpMs -and -not ($tcpMs -is [System.Array])) { $rtt = [double]$tcpMs }
@@ -223,7 +220,7 @@ while($true){
     Append-Line $OutCsv $line
   }
 
-  # --- 繝帙ャ繝・---
+  # --- ホップ ---
   if( ($cycle % $HopProbeEveryCycles) -eq 0 ){
     foreach($ht in $HopTargets){
       $hops = Get-HopsForTarget -target $ht -maxHops $MaxHops
@@ -246,7 +243,7 @@ while($true){
     }
   }
 
-  # Excel髢峨§縺溘ち繧､繝溘Φ繧ｰ縺ｧ蜷域ｵ√ｒ隧ｦ縺ｿ繧・
+  # Excel閉じたタイミングで合流を試みる
   Flush-Queue $OutCsv
   Flush-Queue $HopCsv
 
