@@ -7,6 +7,7 @@
 - ローミング検知（BSSID の変化）
 - 途中経路（各ホップ）のジッタ / ロス（指定サイクルごと）
 - ユーザーの「今遅い！」ワンクリック時刻メモ
+- **サインイン経路の到達**（`login.microsoftonline.com` ほか）
 
 出力は CSV：
 - `teams_net_quality.csv` … エンドツーエンド品質＋AP/ローミング
@@ -41,6 +42,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\windows\Measure-N
 ```
 - 出力：`%LOCALAPPDATA%\TeamsNet\teams_net_quality.csv` / `path_hop_quality.csv`
 - 途中経路計測の頻度は `-HopProbeEveryCycles` で調整（例：10秒間隔×10=100秒ごと）
+- `Targets` には Teams/Graph/CDN/aka.ms に加え、**サインイン関連**：
+  `login.microsoftonline.com` / `aadcdn.msauth.net` / `msauth.net` / `msftauth.net` / `login.live.com`
+- `HopTargets` は負荷を抑えるため標準で `world.tr.teams.microsoft.com` と `login.microsoftonline.com` のみ
 
 2) **「遅い」マーカー（任意）**
 ```powershell
@@ -48,7 +52,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\windows\Add-Teams
 ```
 - 出力：`%LOCALAPPDATA%\TeamsNet\user_marks.csv`
 
-> 注：PowerShell 5.x では **CRLF 改行**が安定です（本リポジトリは `.gitattributes` で PS1=CRLF を強制）。
+> 注：Windows PowerShell 5.x では **CRLF 改行**が安定です（本リポジトリは `.gitattributes` で PS1=CRLF / SH=LF を強制）。
 
 ---
 
@@ -82,7 +86,7 @@ chmod +x ./scripts/macos_linux/add_teams_slow_mark.command
 - **dns_ms**：名前解決（DNS）の所要時間（ms）
 - **tcp_443_ms**：TCP 443 への接続完了（SYN→ESTABLISHED）までの時間（ms）
 - **http_head_ms**：HTTPS で HEAD リクエストが返るまで（TTFB 近似, ms）
-- **mos_estimate**：簡易 MOS（1.0〜4.5）。`RTT` と `loss_pct` からの概算値
+- **mos_estimate**：簡易 MOS（1.0〜4.5）。`RTT` と `loss_pct` からの概算値  
   *目安：4.0 以上 = 良好 / 3.6〜4.0 = 許容 / 3.6 未満 = 悪化傾向*
 - **conn_type**：`wifi` or `wired_or_disconnected`
 - **ssid**：接続 SSID（Wi-Fi 時）
@@ -96,12 +100,12 @@ chmod +x ./scripts/macos_linux/add_teams_slow_mark.command
 ### `path_hop_quality.csv`
 - **timestamp**：同一トレース（同一回）のホップで共通の時刻
 - **target**：traceroute の宛先 FQDN
-- **hop_index**：ホップ番号（1 から順に付与）
+- **hop_index**：ホップ番号（1 から順に付与）  
   *注：ICMP に応答したホップだけを記録するため、実 TTL と一致しないことがあります。*
 - **hop_ip**：そのホップで応答したルータの IPv4 アドレス
 - **icmp_avg_ms / icmp_jitter_ms / loss_pct**：そのホップの ICMP 応答の平均 / ジッタ / 損失
-- **notes**：ホップ単位の補足
-  - `icmp_blocked` … そのホップが ICMP に応答しない / 遮断
+- **notes**：ホップ単位の補足  
+  - `icmp_blocked` … そのホップが ICMP に応答しない / 遮断  
   - `tracert_no_reply` … その回の traceroute で IP が 1 つも取れなかった
 - **conn_type / ssid / bssid / signal_pct / ap_name / roamed / roam_from / roam_to**：上と同じ（計測時の接続状況を添付）
 
@@ -113,31 +117,22 @@ chmod +x ./scripts/macos_linux/add_teams_slow_mark.command
 
 ---
 
-## AP 名マッピング（任意）
+## Wi‑Fi 認識の精度向上（Windows）
 
-`samples/ap_map.csv` を出力先フォルダ（Windows: `%LOCALAPPDATA%\TeamsNet`、macOS/Linux: `~/.local/state/teamsnet`）にコピーし、必要に応じて追記してください。
+日本語環境や複数無線インターフェイス環境で `conn_type=wifi` が `wired_or_disconnected` になる取りこぼしに対応するため、`Get-WifiContext` は以下のロジックで検出します。
 
-```
-bssid,ap_name
-aa:bb:cc:dd:ee:ff,会議室A-天井AP
-aa:bb:cc:dd:ee:f0,執務室-西側
-```
+- `netsh wlan show interfaces` を **インターフェイス単位のセクション**に分割し、**「状態: 接続されています / State: connected」** のセクションのみ採用
+- SSID / BSSID（`aa:bb:...`）/ **シグナル（%）** を日本語/英語の両表記で抽出
+- それでも拾えない場合は `Get-NetAdapter` で **無線IFが Up か**をフォールバック判定（`type=wifi` のみセット）
 
----
-
-## よくある調整
-
-- **ホップ計測の負荷**：Windows は `-HopProbeEveryCycles`、mac/Linux は `HOP_EVERY` で頻度を上げ下げ
-- **1 ホップあたりの回数**：`-HopPingCount` / `HOP_PING`
-- **ターゲット FQDN**：`Targets` / `HOP_TARGETS` を運用に合わせて編集
-- **起動直後にも hop 計測**：`($cycle % HopProbeEveryCycles) -eq 0 -or $cycle -eq 1` にする
+> これにより、**無線LAN接続中なのに有線として記録される**事象を抑制します。
 
 ---
 
 ## 既知の挙動・注意
 
-- 一部の宛先/ルータは **ICMP に低優先 or 応答しない**ため、`icmp_blocked` やホップ欠落が発生します。前後ホップとの差やエンドツーエンド指標と併せて判断してください。
-- CSV を **Excel で開いている間**は追記できないため、`*.csv.queue` に退避します。Excel を閉じると次サイクルで自動合流します。
+- 一部の宛先/ルータは **ICMP に低優先 or 応答しない**ため、`icmp_blocked` やホップ欠落が発生します。前後ホップとの差やエンドツーエンド指標と併せて判断してください。  
+- CSV を **Excel で開いている間**は追記できないため、`*.csv.queue` に退避します。Excel を閉じると次サイクルで自動合流します。  
 - PowerShell 5.x では **CRLF 改行**が安定です（本リポジトリは `.gitattributes` で PS1=CRLF / SH=LF を強制）。
 
 ---

@@ -7,15 +7,44 @@ if(!(Test-Path $MarkCsv)){
 }
 
 function Get-WifiContext {
-  $ssid=$null;$bssid=$null;$signal=$null;$type="wired_or_disconnected"
-  $out = (netsh wlan show interfaces 2>$null) -join "`n"
-  if($LASTEXITCODE -eq 0 -and $out){
-    if($out -match "(?im)^\s*SSID\s*:\s*(.+)$"){ $ssid = $Matches[1].Trim() }
-    $m = [regex]::Match($out,"(?im)^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})")
-    if($m.Success){ $bssid = $m.Groups[1].Value.Replace('-',':').ToLower() }
-    if($out -match "(?im)^\s*Signal\s*:\s*([0-9]{1,3})%"){ $signal = [int]$Matches[1] }
-    if($ssid -or $bssid){ $type = "wifi" }
+  $ssid=$null; $bssid=$null; $signal=$null; $type="wired_or_disconnected"
+
+  # netsh 出力をセクション（インターフェイス単位）に分解
+  $sections=@()
+  $out = netsh.exe wlan show interfaces 2>$null
+  if ($LASTEXITCODE -eq 0 -and $out) {
+    $buf=@()
+    foreach($ln in $out){
+      if($ln -match "^\s*(Name|名前)\s*:"){   # 新しいIFセクション開始
+        if($buf.Count){ $sections += ,($buf -join "`n"); $buf=@() }
+      }
+      $buf += $ln
+    }
+    if($buf.Count){ $sections += ,($buf -join "`n") }
+
+    foreach($sec in $sections){
+      # 「接続済み」のセクションだけ採用（英/日対応）
+      if($sec -match "(?im)^\s*(State|状態)\s*:\s*(connected|接続されています)"){
+        if($sec -match "(?im)^\s*SSID\s*:\s*(.+)$"){ $ssid = $Matches[1].Trim() }
+        $m = [regex]::Match($sec,"(?im)^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})")
+        if($m.Success){ $bssid = $m.Groups[1].Value.Replace('-',':').ToLower() }
+        $sm = [regex]::Match($sec,"(?im)^\s*(Signal|シグナル)\s*:\s*([0-9]{1,3})%")
+        if($sm.Success){ $signal = [int]$sm.Groups[2].Value }
+        $type = "wifi"
+        break
+      }
+    }
   }
+
+  # フォールバック：netshパースに失敗しても、無線IFがUpなら wifi と判定
+  if($type -ne "wifi"){
+    try{
+      $wifi = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object { $_.Status -eq 'Up' -and ( $_.NdisPhysicalMedium -eq 'Native802_11' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi' ) }
+      if($wifi){ $type = "wifi" }
+    } catch {}
+  }
+
   [pscustomobject]@{ type=$type; ssid=$ssid; bssid=$bssid; signal_pct=$signal }
 }
 
