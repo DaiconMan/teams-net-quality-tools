@@ -37,46 +37,58 @@ function Get-ApName([string]$bssid){
 function Get-WifiContext {
   $ssid=$null; $bssid=$null; $signal=$null; $type="wired_or_disconnected"
 
-  # netsh 出力をセクション（インターフェイス単位）に分解
-  $sections=@()
-  $out = netsh.exe wlan show interfaces 2>$null
-  if ($LASTEXITCODE -eq 0 -and $out) {
-    $buf=@()
-    foreach($ln in $out){
-      if($ln -match "^\s*(Name|名前)\s*:"){   # 新しいIFセクション開始
-        if($buf.Count){ $sections += ,($buf -join "`n"); $buf=@() }
-      }
-      $buf += $ln
-    }
-    if($buf.Count){ $sections += ,($buf -join "`n") }
+  # --- netsh を実行して「生バイト」を取得 → CP932(Shift-JIS)として明示デコード ---
+  $tmp = [IO.Path]::GetTempFileName()
+  try {
+    $p = Start-Process -FilePath "netsh.exe" -ArgumentList "wlan","show","interfaces" `
+         -NoNewWindow -RedirectStandardOutput $tmp -PassThru
+    $p.WaitForExit(3000) | Out-Null
 
-    foreach($sec in $sections){
-      # 「接続済み」のセクションだけ採用（英/日対応）
-      if($sec -match "(?im)^\s*(State|状態)\s*:\s*(connected|接続されています)"){
-        if($sec -match "(?im)^\s*SSID\s*:\s*(.+)$"){ $ssid = $Matches[1].Trim() }
-        $m = [regex]::Match($sec,"(?im)^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})")
-        if($m.Success){ $bssid = $m.Groups[1].Value.Replace('-',':').ToLower() }
-        $sm = [regex]::Match($sec,"(?im)^\s*(Signal|シグナル)\s*:\s*([0-9]{1,3})%")
-        if($sm.Success){ $signal = [int]$sm.Groups[2].Value }
+    $bytes = [IO.File]::ReadAllBytes($tmp)
+    try {
+      $text = [Text.Encoding]::GetEncoding(932).GetString($bytes)  # CP932として解釈
+    } catch {
+      $text = [Text.Encoding]::UTF8.GetString($bytes)              # 念のためUTF-8フォールバック
+    }
+
+    $lines = $text -split "`r?`n"
+
+    # 1) BSSID 行を探す（言語非依存、英数字のみ）
+    $bidx = $null
+    for ($i=0; $i -lt $lines.Length; $i++) {
+      if ($lines[$i] -match '^\s*BSSID\s*:\s*(([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2})') {
+        $bssid = $Matches[1].Replace('-',':').ToLower()
         $type = "wifi"
+        $bidx = $i
         break
       }
     }
+
+    # 2) 同じインターフェイスの近傍から SSID と Signal(%) を抜く
+    if ($type -eq "wifi") {
+      $start = [Math]::Max(0, $bidx - 15)
+      $end   = [Math]::Min($lines.Length - 1, $bidx + 15)
+      for ($j=$start; $j -le $end; $j++) {
+        if (-not $ssid   -and $lines[$j] -match '^\s*SSID\s*:\s*(.+)$') { $ssid   = $Matches[1].Trim() }
+        if (-not $signal -and $lines[$j] -match ':\s*([0-9]{1,3})\s*%') { $signal = [int]$Matches[1]   }
+        if ($ssid -and $signal) { break }
+      }
+    }
+  } finally {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
   }
 
-  # フォールバック：netshパースに失敗しても、無線IFがUpなら wifi と判定
-  if($type -ne "wifi"){
-    try{
+  # 3) フォールバック：無線IFがUpなら type=wifi だけ立てる
+  if ($type -ne "wifi") {
+    try {
       $wifi = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
         Where-Object { $_.Status -eq 'Up' -and ( $_.NdisPhysicalMedium -eq 'Native802_11' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi' ) }
-      if($wifi){ $type = "wifi" }
+      if ($wifi) { $type = "wifi" }
     } catch {}
   }
 
   [pscustomobject]@{ type=$type; ssid=$ssid; bssid=$bssid; signal_pct=$signal }
 }
-
-
 function Measure-DnsTime([string]$target){
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   try { [System.Net.Dns]::GetHostAddresses($target) | Out-Null } catch {}
