@@ -38,6 +38,6 @@ else
   fi
 fi
 
-read -p "（任意）症状メモ（空OK）： " comment
+read -p "・井ｻｻ諢擾ｼ臥裸迥ｶ繝｡繝｢・育ｩｺOK・会ｼ・" comment
 printf '%s,%s,%s,%s,%s,%s,%s,"%s"\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(whoami)" "$(hostname)" "$conn_type" "$ssid" "$bssid" "$signal" "$comment" >> "$OUTCSV"
-echo "記録しました。"
+echo "險倬鹸縺励∪縺励◆縲・

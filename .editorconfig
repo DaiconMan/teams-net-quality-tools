@@ -1,0 +1,65 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = true
+
+; --- PowerShell (Windows PowerShell 5.x 互換のため BOM+CRLF) ---
+[*.ps1]
+end_of_line = crlf
+charset = utf-8-bom
+indent_size = 2
+
+[*.psm1]
+end_of_line = crlf
+charset = utf-8-bom
+indent_size = 2
+
+[*.psd1]
+end_of_line = crlf
+charset = utf-8-bom
+indent_size = 2
+
+; --- Windows バッチ ---
+[*.bat]
+end_of_line = crlf
+charset = utf-8
+
+[*.cmd]
+end_of_line = crlf
+charset = utf-8
+
+; --- Unix系シェル ---
+[*.sh]
+end_of_line = lf
+charset = utf-8
+
+[*.command]
+end_of_line = lf
+charset = utf-8
+
+; --- 一般テキスト ---
+[*.json]
+end_of_line = lf
+charset = utf-8
+
+[*.yml]
+end_of_line = lf
+charset = utf-8
+
+[*.yaml]
+end_of_line = lf
+charset = utf-8
+
+[*.md]
+end_of_line = lf
+charset = utf-8
+
+; --- GitHub Actions ---
+[.github/workflows/*.yml]
+end_of_line = lf
+charset = utf-8
