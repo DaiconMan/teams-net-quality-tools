@@ -1,26 +1,16 @@
-
-# Merge-TeamsNet-CSV.ps1
-# 位置指定(ポジショナル)を明示的にブロックし、必ず名前付き(-InputCsvs, -Tags, -Output)で受ける
-
+# Merge-TeamsNet-CSV.ps1  --  名前付き引数専用: -InputCsvs / -Tags / -Output [/ -Utf8Bom]
 [CmdletBinding()]
 param(
-  # --- 位置指定ブロッカー（位置引数で来たら即エラーにする） ---
-  [Parameter(Position=0)]
-  [AllowNull()]
-  [string]$__arg0,
+  # 位置指定で渡されたら明示エラーにするブロッカー
+  [Parameter(Position=0)][AllowNull()][string]$__arg0,
+  [Parameter(Position=1)][AllowNull()][string]$__arg1,
 
-  [Parameter(Position=1)]
-  [AllowNull()]
-  [string]$__arg1,
-
-  # --- 本来の引数（名前付きで渡すこと） ---
+  # ← 必ず名前付きで指定
   [Parameter(Mandatory=$true)]
-  [Alias('Input','Files','Csvs')]
-  [object]$InputCsvs,
+  [object]$InputCsvs,   # 文字列/配列/「;」区切り いずれもOK（下で正規化）
 
   [Parameter(Mandatory=$true)]
-  [Alias('Tag','TagsList')]
-  [object]$Tags,
+  [object]$Tags,        # 同上（件数は InputCsvs と一致必須）
 
   [Parameter()]
   [string]$Output = ".\merged_teams_net_quality.csv",
@@ -28,9 +18,9 @@ param(
   [switch]$Utf8Bom
 )
 
-# ========== 位置指定の明示ブロック ==========
+# 位置指定ブロック
 if ($PSBoundParameters.ContainsKey('__arg0') -and $null -ne $__arg0) {
-  throw "このスクリプトは『名前付き引数のみ』対応です。-InputCsvs と -Tags を必ず付けてください。（例: -InputCsvs @('a.csv','b.csv') -Tags @('8F-A','10F-B')）"
+  throw "このスクリプトは『名前付き引数のみ』対応です。-InputCsvs と -Tags を必ず付けてください。"
 }
 if ($PSBoundParameters.ContainsKey('__arg1') -and $null -ne $__arg1) {
   throw "このスクリプトは『名前付き引数のみ』対応です。-InputCsvs と -Tags を必ず付けてください。"
@@ -49,42 +39,35 @@ function To-StringArray([object]$x){
   } else { return @("$x") }
 }
 
-# 入力正規化（配列/セミコロン区切り/単体 いずれも許容）
+# 入力正規化
 $files = To-StringArray $InputCsvs
 $tags  = To-StringArray $Tags
 
-# フルパス化＆存在チェック
+# フルパス化 & 存在検証
 $files = $files | ForEach-Object {
-  $p = $_
-  if(-not (Test-Path $p)){ throw "CSV not found: $p" }
-  (Resolve-Path $p).Path
+  if(-not (Test-Path $_)){ throw "CSV not found: $_" }
+  (Resolve-Path $_).Path
 }
 
-# 個数整合
 if($files.Count -ne $tags.Count){
   throw "Files($($files.Count)) と Tags($($tags.Count)) の数が一致しません。-InputCsvs と -Tags を見直してください。"
 }
 
-# すべてのヘッダーの和集合（大文字小文字無視）
+# ヘッダー和集合（大文字小文字無視）
 $cmp = [System.StringComparer]::OrdinalIgnoreCase
 $all = New-Object System.Collections.Generic.HashSet[string] $cmp
 
-# 付加するメタ列
+# 付与するメタ列
 $meta = @('probe','machine','user','tz_offset','source_file')
 foreach($m in $meta){ [void]$all.Add($m) }
 
 $datasets = @()
 
-for($i=0; $i -lt $files.Count; $i++){
-  $path = $files[$i]
-  $tag  = $tags[$i]
+for($i=0;$i -lt $files.Count;$i++){
+  $path = $files[$i]; $tag  = $tags[$i]
 
-  # UTF-8優先、失敗時は既定(Windows: CP932)で再試行
-  try {
-    $rows = Import-Csv -Path $path -Encoding UTF8
-  } catch {
-    $rows = Import-Csv -Path $path -Encoding Default
-  }
+  try   { $rows = Import-Csv -Path $path -Encoding UTF8 }
+  catch { $rows = Import-Csv -Path $path -Encoding Default }
 
   if(-not $rows -or $rows.Count -eq 0){
     Write-Warning "Empty CSV skipped: $path"
@@ -105,14 +88,12 @@ for($i=0; $i -lt $files.Count; $i++){
   }
 }
 
-if($datasets.Count -eq 0){
-  throw "有効な入力CSVがありませんでした。"
-}
+if($datasets.Count -eq 0){ throw "有効な入力CSVがありませんでした。" }
 
-# 和集合ヘッダーを配列化（既存列→メタ列の順）
+# 和集合ヘッダー（既存列→メタ列）
 $allHeaders = @($all.ToArray() | Where-Object { $meta -notcontains $_ }) + $meta
 
-# 出力行の生成
+# 出力行生成
 $out = New-Object System.Collections.Generic.List[object]
 foreach($ds in $datasets){
   $machine = $env:COMPUTERNAME
@@ -122,7 +103,7 @@ foreach($ds in $datasets){
   foreach($r in $ds.Rows){
     $row = [ordered]@{}
     foreach($h in $allHeaders){
-      if($meta -contains $h){ continue }  # メタ列は後で付与
+      if($meta -contains $h){ continue }
       if($r.PSObject.Properties.Name -contains $h){
         $row[$h] = $r.$h
       } else {
@@ -130,7 +111,6 @@ foreach($ds in $datasets){
         $row[$h] = if($k){ $r.$k } else { $null }
       }
     }
-    # メタ列
     $row['probe']       = $ds.Tag
     $row['machine']     = $machine
     $row['user']        = $user
@@ -141,7 +121,7 @@ foreach($ds in $datasets){
   }
 }
 
-# 出力（Excelでの再編集を考慮して既定はUTF-8、必要ならBOM付き）
+# 書き出し
 $enc = if($Utf8Bom){ 'UTF8BOM' } else { 'UTF8' }
 $out | Export-Csv -NoTypeInformation -Encoding $enc -Path $Output
 Write-Host "Merged -> $Output (`"$($out.Count)`" rows)"
