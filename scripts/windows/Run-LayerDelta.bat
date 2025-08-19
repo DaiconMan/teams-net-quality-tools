@@ -17,18 +17,9 @@ set "OUTDIR=%BASEDIR%\Output"
 set "OUT=%OUTDIR%\TeamsNet-Report.xlsx"
 
 rem --- Pre checks ---
-if not exist "%PS%" (
-  echo [ERROR] PS script not found: "%PS%"
-  goto :fail
-)
-if not exist "%TARGETS%" (
-  echo [ERROR] targets.csv not found (expected one level up): "%TARGETS%"
-  goto :fail
-)
-if not exist "%CSV%" (
-  echo [ERROR] data CSV not found: "%CSV%"
-  goto :fail
-)
+if not exist "%PS%"       ( echo [ERROR] PS script not found: "%PS%" & popd & exit /b 1 )
+if not exist "%TARGETS%"  ( echo [ERROR] targets.csv not found one level up: "%TARGETS%" & popd & exit /b 1 )
+if not exist "%CSV%"      ( echo [ERROR] data CSV not found: "%CSV%" & popd & exit /b 1 )
 
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
@@ -52,16 +43,12 @@ if exist "%FLOORFILE%" (
     -BucketMinutes 5 -ThresholdMs 100 2^>^&1
 )
 
-set "ERR=%ERRORLEVEL%"
-if not "%ERR%"=="0" (
-  echo [ERROR] PowerShell script failed. ERRORLEVEL=%ERR%
-  goto :fail
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+  echo [ERROR] PowerShell script failed. ERRORLEVEL=%RC%
+  popd & exit /b %RC%
 )
 
 echo [OK] Report generated: "%OUT%"
 popd
 exit /b 0
-
-:fail
-popd
-exit /b %ERR%
