@@ -1,5 +1,5 @@
 <#
-Generate-TeamsNet-Report.ps1
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放)
 
 機能:
 - teams_net_quality.csv を集計し、同一Excelブックに以下を出力
@@ -7,7 +7,7 @@ Generate-TeamsNet-Report.ps1
   2) DeltaSeries: 上記の区間差(Δ) = L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN
   3) ホスト別シート: targets.csv の各行(=ターゲット)ごとに1シート、AP名/BSSID/SSIDからフロアを推定 or floors.csv で色分けし、時系列グラフ＋しきい値線を描画
 - SAAS/Zscaler は ICMPが得られない想定のため TCP/HTTP を優先、L2/L3/RTR* は ICMP を優先
-- PowerShell 5.1 互換。Excel COM は必ず Quit/Release する
+- PowerShell 純正記法のみ（「if を式として使う」書き方は不使用）
 
 使い方(例):
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -26,9 +26,6 @@ Generate-TeamsNet-Report.ps1
 
 出力:
 - Output: Excelブック (LayerSeries, DeltaSeries, 各ターゲットのシート, INDEX)
-
-注意:
-- .ps1 内は PowerShell 構文のみ（CMDの if exist/goto などは一切使用しない）
 #>
 
 [CmdletBinding()]
@@ -51,6 +48,7 @@ function Release-Com([object]$obj){
     try{ [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($obj) }catch{}
   }
 }
+
 function Sanitize-SheetName([string]$name){
   if(-not $name){ return 'Sheet' }
   $n = $name -replace '[:\\/\?\*$begin:math:display$$end:math:display$]','_'
@@ -58,18 +56,36 @@ function Sanitize-SheetName([string]$name){
   if($n -match '^\s*$'){ $n='Sheet' }
   return $n
 }
+
 function Normalize-Host([string]$s){
-  if(-not $s){ return '' }
+  if ([string]::IsNullOrWhiteSpace($s)) { return '' }
   $t = $s.Trim().Trim('"',"'").ToLowerInvariant()
-  if($t -match '$begin:math:text$([0-9]{1,3}(?:\\.[0-9]{1,3}){3})$end:math:text$'){ return $Matches[1] }  # name (ip)
-  if($t -match '$begin:math:display$([0-9a-f:]+)$end:math:display$'){ return $Matches[1] }                    # name [ipv6]
-  try{ $uri=$null; if([System.Uri]::TryCreate($t,[System.UriKind]::Absolute,[ref]$uri) -and $uri.Host){ $t=$uri.Host.ToLowerInvariant() } }catch{}
+  if ([string]::IsNullOrEmpty($t)) { return '' }
+
+  if ($t -match '$begin:math:text$([0-9]{1,3}(?:\\.[0-9]{1,3}){3})$end:math:text$') { return $Matches[1] } # name (ipv4)
+  if ($t -match '$begin:math:display$([0-9a-f:]+)$end:math:display$')                   { return $Matches[1] } # name [ipv6]
+
+  try {
+    $uri = $null
+    if ([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host) {
+      $t = $uri.Host.ToLowerInvariant()
+    }
+  } catch {}
+
   $t = $t.TrimEnd('.').Trim('[',']')
-  $isIPv6=$false; try{ $ip=$null; if([System.Net.IPAddress]::TryParse($t,[ref]$ip)){ $isIPv6=($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) } }catch{}
-  if(-not $isIPv6){ if($t -match '^(.+?):(\d+)$'){ $t=$Matches[1] } }
-  if($t -match '(^|\s)(\d{1,3}(?:\.\d{1,3}){3})(\s|$)'){ return $Matches[2] }
+  if ([string]::IsNullOrEmpty($t)) { return '' }
+
+  try {
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($t, [ref]$ip)) { return $t }
+  } catch {}
+
+  if ($t -match '^(.+?):(\d+)$' -and $t -notmatch '^$begin:math:display$.+$end:math:display$') { $t = $Matches[1] }
+  if ($t -match '(^|\s|$begin:math:text$)(\\d{1,3}(?:\\.\\d{1,3}){3})(\\s|$end:math:text$|:|$)') { return $Matches[2] }
+
   return $t
 }
+
 function To-DoubleOrNull($v){
   if($v -is [double]){ return [double]$v }
   $s=(''+$v).Trim()
@@ -79,19 +95,23 @@ function To-DoubleOrNull($v){
   if([double]::TryParse($s,[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::CurrentCulture,[ref]$d)){ return [double]$d }
   return $null
 }
+
 function Write-Column2D($ws,[string]$addr,[object[]]$arr){
-  $n = if($arr){ [int]$arr.Count } else { 0 }
+  $n = 0
+  if($arr){ $n = [int]$arr.Count }
   if($n -le 0){ return }
   $data = New-Object 'object[,]' $n,1
   for($i=0;$i -lt $n;$i++){ $data[$i,0]=$arr[$i] }
   $ws.Range($addr).Resize($n,1).Value2 = $data
 }
+
 function New-RepeatedArray([object]$value,[int]$count){
   if($count -le 0){ return @() }
   $a = New-Object object[] $count
   for($i=0;$i -lt $count;$i++){ $a[$i]=$value }
   return $a
 }
+
 function Format-Err([System.Management.Automation.ErrorRecord]$e){
   $ii=$e.InvocationInfo
   $parts=@("[ERROR] $($e.FullyQualifiedErrorId)")
@@ -99,6 +119,11 @@ function Format-Err([System.Management.Automation.ErrorRecord]$e){
   $ex=$e.Exception
   if($ex){ $parts += "$($ex.GetType().FullName): $($ex.Message)" }
   return ($parts -join "`r`n")
+}
+
+function Sub-OrNull($a,$b){
+  if($a -ne $null -and $b -ne $null){ return [double]($a-$b) }
+  return $null
 }
 
 # ---------------- CSV 読み込み ----------------
@@ -141,13 +166,14 @@ function Get-HopN([int]$n){
   }catch{}
   return $null
 }
+
 function Parse-TargetsCsv([string]$path){
   if(-not (Test-Path $path)){ throw "targets.csv not found: $path" }
   $rows = Import-Csv -Path $path -Encoding UTF8
   if(-not $rows -or $rows.Count -eq 0){ throw "targets.csv is empty: $path" }
-  $gw = Get-DefaultGatewayIPv4
-  $hop2 = Get-HopN 2
-  $hop3 = Get-HopN 3
+  $gw  = Get-DefaultGatewayIPv4
+  $hop2= Get-HopN 2
+  $hop3= Get-HopN 3
   $list = New-Object System.Collections.Generic.List[object]
   foreach($r in $rows){
     $role  = (''+$r.role).Trim().ToUpperInvariant()
@@ -157,11 +183,15 @@ function Parse-TargetsCsv([string]$path){
     if($key -eq '{GATEWAY}' -and $gw){ $key=$gw }
     if($key -eq '{HOP2}'    -and $hop2){ $key=$hop2 }
     if($key -eq '{HOP3}'    -and $hop3){ $key=$hop3 }
+
+    $lab = $key
+    if (-not [string]::IsNullOrWhiteSpace($label)) { $lab = $label }
+
     $list.Add([pscustomobject]@{
-      Role = $role
-      Key = $key
-      KeyNorm = Normalize-Host $key
-      Label = (if($label){ $label } else { $key })
+      Role   = $role
+      Key    = $key
+      KeyNorm= (Normalize-Host $key)
+      Label  = $lab
     })
   }
   if($list.Count -eq 0){ throw "No valid entries in targets.csv (after placeholders)" }
@@ -208,9 +238,10 @@ function Guess-Floor([string]$apName,[string]$bssid,[string]$ssid){
 
 # ---------------- 有効RTT 選択（役割別） ----------------
 function Pick-EffRtt([string]$role,[object]$row){
-  $icmp = if($colIcmp){ To-DoubleOrNull $row.$colIcmp } else { $null }
-  $tcp  = if($colTcp ){ To-DoubleOrNull $row.$colTcp  } else { $null }
-  $http = if($colHttp){ To-DoubleOrNull $row.$colHttp } else { $null }
+  $icmp = $null; if ($colIcmp) { $icmp = To-DoubleOrNull $row.$colIcmp }
+  $tcp  = $null; if ($colTcp ) { $tcp  = To-DoubleOrNull $row.$colTcp  }
+  $http = $null; if ($colHttp) { $http = To-DoubleOrNull $row.$colHttp }
+
   if($role -like 'RTR*' -or $role -eq 'L2' -or $role -eq 'L3'){
     if($icmp -ne $null){ return ,@($icmp,'icmp') }
     if($tcp  -ne $null){ return ,@($tcp ,'tcp') }
@@ -272,20 +303,25 @@ foreach($k in $keys){
       $valsThis[$r]=$null
     }
   }
-  function SubOrNull($a,$b){ if($a -ne $null -and $b -ne $null){ return [double]($a-$b) } else { return $null } }
-  $l2  = if($valsThis.ContainsKey('L2')){ $valsThis['L2'] }else{$null}
-  $l3  = if($valsThis.ContainsKey('L3')){ $valsThis['L3'] }else{$null}
-  $lan = if($valsThis.ContainsKey('RTR_LAN')){ $valsThis['RTR_LAN'] }else{$null}
-  $wan = if($valsThis.ContainsKey('RTR_WAN')){ $valsThis['RTR_WAN'] }else{$null}
-  $saas= if($valsThis.ContainsKey('SAAS')){ $valsThis['SAAS'] }else{$null}
-  $delta['DELTA_L3']      += (SubOrNull $l3  $l2)
-  $delta['DELTA_RTR_LAN'] += (SubOrNull $lan $l3)
-  $delta['DELTA_RTR_WAN'] += (SubOrNull $wan $lan)
-  $delta['DELTA_CLOUD']   += (SubOrNull $saas $wan)
+  $l2  = $null; if($valsThis.ContainsKey('L2'))      { $l2  = $valsThis['L2'] }
+  $l3  = $null; if($valsThis.ContainsKey('L3'))      { $l3  = $valsThis['L3'] }
+  $lan = $null; if($valsThis.ContainsKey('RTR_LAN')) { $lan = $valsThis['RTR_LAN'] }
+  $wan = $null; if($valsThis.ContainsKey('RTR_WAN')) { $wan = $valsThis['RTR_WAN'] }
+  $saas= $null; if($valsThis.ContainsKey('SAAS'))    { $saas= $valsThis['SAAS'] }
+
+  $delta['DELTA_L3']      += (Sub-OrNull $l3  $l2)
+  $delta['DELTA_RTR_LAN'] += (Sub-OrNull $lan $l3)
+  $delta['DELTA_RTR_WAN'] += (Sub-OrNull $wan $lan)
+  $delta['DELTA_CLOUD']   += (Sub-OrNull $saas $wan)
 }
 
 # ---------------- Excel 出力 ----------------
-[int]$xlXYScatterLines=74; [int]$xlLegendBottom=-4107; [int]$xlCategory=1; [int]$xlValue=2; [int]$msoLineDash=4
+[int]$xlXYScatterLines=74
+[int]$xlLegendBottom=-4107
+[int]$xlCategory=1
+[int]$xlValue=2
+[int]$msoLineDash=4
+
 $excel=$null; $wb=$null
 try{
   $excel = New-Object -ComObject Excel.Application
@@ -394,12 +430,13 @@ try{
       $ts=''+$row.$colTime; if(-not $ts){ continue }
       try{ $dt=[datetime]::Parse($ts,$ciCur) }catch{ try{ $dt=[datetime]::Parse($ts,$ciInv) }catch{ continue } }
       [double]$x=$dt.ToOADate()
+
       $pair=Pick-EffRtt $t.Role $row
       $y=$pair[0]; if($y -eq $null){ continue }
 
-      $apName = if($colAp){ ''+$row.$colAp } else { '' }
-      $bssid  = if($colBssid){ ''+$row.$colBssid } else { '' }
-      $ssidv  = if($colSsid){ ''+$row.$colSsid } else { '' }
+      $apName = ''; if ($colAp)    { $apName = ''+$row.$colAp }
+      $bssid  = ''; if ($colBssid) { $bssid  = ''+$row.$colBssid }
+      $ssidv  = ''; if ($colSsid)  { $ssidv  = ''+$row.$colSsid }
       $floor  = Guess-Floor $apName $bssid $ssidv
 
       if(-not $byFloor.ContainsKey($floor)){
@@ -458,7 +495,6 @@ try{
     foreach($fl in $floorList){
       $s=$c.SeriesCollection().NewSeries()
       $s.Name=("RTT ({0})" -f $fl)
-      # データ範囲は末尾まで自動検出
       $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row  # xlUp=-4162
       $endRowVal  = ($ws.Cells($ws.Rows.Count,$colIdx+1).End(-4162)).Row
       $endRow = [Math]::Max($endRowTime,$endRowVal)
