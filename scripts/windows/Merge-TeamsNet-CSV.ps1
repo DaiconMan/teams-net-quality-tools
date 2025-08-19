@@ -43,16 +43,16 @@ $files = To-StringArray $InputCsvs
 $tags  = To-StringArray $Tags
 
 # フルパス化 & 存在検証
-$files = $files | ForEach-Object {
-  if(-not (Test-Path $_)){ throw "CSV not found: $_" }
-  (Resolve-Path $_).Path
+$files = foreach($p in $files){
+  if(-not (Test-Path -LiteralPath $p)){ throw "CSV not found: $p" }
+  (Resolve-Path -LiteralPath $p).Path
 }
 
 if($files.Count -ne $tags.Count){
   throw "Files($($files.Count)) と Tags($($tags.Count)) の数が一致しません。-InputCsvs と -Tags を見直してください。"
 }
 
-# ヘッダー和集合（大文字小文字無視）
+# ヘッダー和集合（大文字小文字無視）-- ToArray() 不使用
 $cmp = [System.StringComparer]::OrdinalIgnoreCase
 $all = New-Object System.Collections.Generic.HashSet[string] $cmp
 
@@ -86,10 +86,14 @@ for($i=0;$i -lt $files.Count;$i++){
 
 if($datasets.Count -eq 0){ throw "有効な入力CSVがありませんでした。" }
 
-# 和集合ヘッダー（既存列→メタ列）
-$allHeaders = @($all.ToArray() | Where-Object { $meta -notcontains $_ }) + $meta
+# 和集合ヘッダー（既存列→メタ列）-- ToArray() 不使用
+$existingHeaders = @()
+foreach($h in $all){
+  if($meta -notcontains $h){ $existingHeaders += $h }
+}
+$allHeaders = @($existingHeaders + $meta)
 
-# 出力行生成
+# 出力行生成（List で確実に積む）
 $out = New-Object System.Collections.Generic.List[object]
 foreach($ds in $datasets){
   $machine = $env:COMPUTERNAME
@@ -113,7 +117,7 @@ foreach($ds in $datasets){
     $row['tz_offset']   = $tz
     $row['source_file'] = $ds.Path
 
-    $out.Add([pscustomobject]$row) | Out-Null
+    [void]$out.Add([pscustomobject]$row)
   }
 }
 
