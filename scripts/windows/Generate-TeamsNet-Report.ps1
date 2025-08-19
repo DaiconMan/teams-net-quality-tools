@@ -1,10 +1,11 @@
 <#
-Generate-TeamsNet-Report.ps1  (PowerShell 5.1 / Excel COM 解放 / メモリ対策 / COM安全化 / 視認性強化)
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 / Excel COM解放 / 視認性・堅牢性強化 / Floor判定改善)
 
 出力:
   - LayerSeries: 役割別のRTT（時間バケット平均）
   - DeltaSeries: 層間のΔ (L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN)
   - 各ターゲットシート: フロア別に色分けした時系列グラフ（しきい値線、細線＋小マーカー）
+  - floors.csv によるフロア判定（BSSID表記ゆれを正規化）。Unknown 綴りを統一。
 
 実行例:
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -26,7 +27,7 @@ param(
   [int]$ThresholdMs = 100,
   [string]$FloorMap,
   [switch]$Visible,
-  [int]$IgnoreTimeoutAtOrAboveMs = 9000  # 9000ms以上はグラフから除外（タイムアウト等）
+  [int]$IgnoreTimeoutAtOrAboveMs = 9000  # これ以上はグラフから除外（タイムアウト等）
 )
 
 # ===== 共通設定 =====
@@ -53,7 +54,7 @@ function Set-ExcelPerfMode($app, [bool]$on){
     }
   }catch{}
 }
-# 禁止文字のみ "_" にし、日本語/英数は保持。空や"___"だけになる場合は 'Sheet'。
+# 禁止文字のみ "_" にし、日本語/英数は保持。空や"___"だけなら 'Sheet'。
 function Sanitize-SheetName([string]$name){
   if([string]::IsNullOrWhiteSpace($name)){ return 'Sheet' }
   $invalid = @(':','\','/','?','*','[',']')
@@ -171,6 +172,22 @@ function Test-MapHasKey($map, $key){
   try { return ($map.Keys -contains $key) } catch { return $false }
 }
 
+# --- BSSID 正規化（追加） ---
+# 12桁lower hexへ正規化（区切り除去）。失敗時は空文字。
+function Canon-Bssid([string]$b){
+  if([string]::IsNullOrWhiteSpace($b)){ return '' }
+  $s = (''+$b).ToLowerInvariant() -replace '[^0-9a-f]',''
+  if($s.Length -ne 12){ return '' }
+  return $s
+}
+# 同じBSSIDを2形式のキーに展開（区切り無し / コロン区切り）
+function Bssid-Keys([string]$b){
+  $c = Canon-Bssid $b; if(-not $c){ return @() }
+  $colon = ($c -replace '(..)(?!$)','$1:')
+  $colon = $colon.TrimEnd(':')
+  return @("bssid::$c","bssid::$colon")
+}
+
 # --- 有効RTT選択: 役割に応じて ICMP/TCP/HTTP の優先度を適用 ---
 function Pick-EffRtt {
   param(
@@ -268,25 +285,27 @@ foreach($t in $targets){
   $roleKeys[$t.Role].Add($t)
 }
 
-# ===== フロア判定 =====
+# ===== floors.csv（表記ゆれ吸収してマップ化） =====
 $floorMap=@{}
 if($FloorMap -and (Test-Path $FloorMap)){
   $fm = Import-Csv -Path $FloorMap -Encoding UTF8
   foreach($r in $fm){
-    $b=(''+$r.bssid).ToLowerInvariant()
-    $an=(''+$r.ap_name).ToLowerInvariant()
-    $f=(''+$r.floor).Trim()
-    if($b){ $floorMap["bssid::$b"]=$f }
-    if($an){ $floorMap["ap::$an"]=$f }
+    $b = (''+$r.bssid)
+    $an= (''+$r.ap_name)
+    $f = (''+$r.floor).Trim()
+    if([string]::IsNullOrWhiteSpace($f)){ $f='Unknown' }  # 綴り統一
+    foreach($k in (Bssid-Keys $b)){ if($k){ $floorMap[$k]=$f } }  # BSSIDは複数キー
+    if($an){ $floorMap["ap::"+$an.Trim().ToLowerInvariant()] = $f }  # AP名キー
   }
 }
 function Guess-Floor([string]$apName,[string]$bssid,[string]$ssid){
   if($bssid){
-    $k="bssid::"+$bssid.ToLowerInvariant()
-    if(Test-MapHasKey $floorMap $k){ return $floorMap[$k] }
+    foreach($k in (Bssid-Keys $bssid)){
+      if($k -and (Test-MapHasKey $floorMap $k)){ return $floorMap[$k] }
+    }
   }
   if($apName){
-    $k="ap::"+$apName.ToLowerInvariant()
+    $k="ap::"+$apName.Trim().ToLowerInvariant()
     if(Test-MapHasKey $floorMap $k){ return $floorMap[$k] }
   }
   foreach($c in @($apName,$ssid)){
@@ -370,6 +389,7 @@ foreach($k in $keys){
 [int]$xlCategory=1
 [int]$xlValue=2
 [int]$msoLineDash=4
+[int]$xlUp=-4162
 
 $excel=$null; $wb=$null
 try{
@@ -386,7 +406,7 @@ try{
     $ws1=$wb.Worksheets.Item(1); $ws1.Name='LayerSeries'
     $ws1.Cells(1,1).Value2='timestamp'
     Write-Column2D $ws1 'A2' $X
-    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End(-4162)).Row
+    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End($xlUp)).Row
     try{ $ws1.Range(("A2:A{0}" -f $endRowA)).NumberFormatLocal='mm/dd hh:mm' }catch{}
     $col=2
     foreach($r in $roleOrder){
@@ -399,10 +419,10 @@ try{
     $ch1=$ws1.ChartObjects().Add(320,10,900,330); $c1=$ch1.Chart
     $c1.ChartType=$xlXYScatterLines; $c1.HasTitle=$true; $c1.ChartTitle.Text='Layer RTT (bucket avg)'; $c1.Legend.Position=$xlLegendBottom
     try{ $c1.SeriesCollection().Delete() }catch{}
-    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End(-4162)).Row
+    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End($xlUp)).Row
     $sCol=2
     foreach($r in $roleOrder){
-      $lastValRow = ($ws1.Cells($ws1.Rows.Count,$sCol).End(-4162)).Row
+      $lastValRow = ($ws1.Cells($ws1.Rows.Count,$sCol).End($xlUp)).Row
       $s=$c1.SeriesCollection().NewSeries()
       $s.Name=$r
       $s.XValues=$ws1.Range(("A2:A{0}" -f $endRowA))
@@ -419,7 +439,7 @@ try{
     $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
     Write-Column2D $ws2 'A2' $X
-    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End(-4162)).Row
+    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End($xlUp)).Row
     try{ $ws2.Range(("A2:A{0}" -f $endRowA2)).NumberFormatLocal='mm/dd hh:mm' }catch{}
     $col=2
     foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
@@ -431,11 +451,11 @@ try{
     $ch2=$ws2.ChartObjects().Add(320,10,900,330); $c2=$ch2.Chart
     $c2.ChartType=$xlXYScatterLines; $c2.HasTitle=$true; $c2.ChartTitle.Text='Layer Δ (bucket avg)'; $c2.Legend.Position=$xlLegendBottom
     try{ $c2.SeriesCollection().Delete() }catch{}
-    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End(-4162)).Row
+    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End($xlUp)).Row
     $names=@('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')
     for($i=0;$i -lt $names.Count;$i++){
       $col = 2+$i
-      $lastValRow = ($ws2.Cells($ws2.Rows.Count,$col).End(-4162)).Row
+      $lastValRow = ($ws2.Cells($ws2.Rows.Count,$col).End($xlUp)).Row
       $s=$c2.SeriesCollection().NewSeries()
       $s.Name=$names[$i]
       $s.XValues=$ws2.Range(("A2:A{0}" -f $endRowA2))
@@ -537,8 +557,8 @@ try{
     foreach($fl in $floorList){
       $s=$c.SeriesCollection().NewSeries()
       $s.Name=("RTT ({0})" -f $fl)
-      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row
-      $endRowVal  = ($ws.Cells($ws.Rows.Count,$colIdx+1).End(-4162)).Row
+      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End($xlUp)).Row
+      $endRowVal  = ($ws.Cells($ws.Rows.Count,$colIdx+1).End($xlUp)).Row
       $endRow = [Math]::Max($endRowTime,$endRowVal)
       $s.XValues=$ws.Range(($ws.Cells(2,$colIdx).Address()+":"+$ws.Cells($endRow,$colIdx).Address()))
       $s.Values =$ws.Range(($ws.Cells(2,$colIdx+1).Address()+":"+$ws.Cells($endRow,$colIdx+1).Address()))
@@ -548,7 +568,7 @@ try{
     # 閾値
     $s2=$c.SeriesCollection().NewSeries()
     $s2.Name=("threshold {0} ms" -f [int]$ThresholdMs)
-    $endRow = ($ws.Cells($ws.Rows.Count,$col).End(-4162)).Row
+    $endRow = ($ws.Cells($ws.Rows.Count,$col).End($xlUp)).Row
     $s2.XValues=$ws.Range(($ws.Cells(2,$col).Address()+":"+$ws.Cells($endRow,$col).Address()))
     $s2.Values =$ws.Range(($ws.Cells(2,$col+1).Address()+":"+$ws.Cells($endRow,$col+1).Address()))
     try{ $s2.Format.Line.ForeColor.RGB=255; $s2.Format.Line.Weight=1; $s2.Format.Line.DashStyle=$msoLineDash }catch{}
