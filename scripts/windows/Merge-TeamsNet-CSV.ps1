@@ -1,15 +1,50 @@
 param(
-  [Parameter(Mandatory=$true)][string[]]$InputCsvs,    # 各拠点のCSV
-  [Parameter(Mandatory=$true)][string[]]$Tags,         # 各CSVに対応する送信元タグ（8F-DeskA 等）
-  [string]$Output = ".\merged_teams_net_quality.csv",  # 出力CSV
-  [switch]$Utf8Bom                                      # 明示的にBOM付きで出力したい場合
+  # 位置0: CSVパス（1本 or 複数）。";" 区切りも可
+  [Parameter(Mandatory=$true, Position=0)]
+  [Alias('Input','Files','Csvs')]
+  [object]$InputCsvs,
+
+  # 位置1: タグ（1つ or 複数）。";" 区切りも可
+  [Parameter(Mandatory=$true, Position=1)]
+  [Alias('Tag','TagsList')]
+  [object]$Tags,
+
+  # 位置2: 出力ファイル
+  [Parameter(Position=2)]
+  [string]$Output = ".\merged_teams_net_quality.csv",
+
+  [switch]$Utf8Bom
 )
 
-$ErrorActionPreference = 'Stop'
-
-if($Tags.Count -ne $InputCsvs.Count){
-  throw "Tags の数($($Tags.Count))が InputCsvs の数($($InputCsvs.Count))と一致しません。"
+function To-StringArray([object]$x){
+  if($null -eq $x){ return @() }
+  if($x -is [string]){
+    $s=$x.Trim()
+    if($s -like "*;*"){ return ($s -split ';') | ForEach-Object { $_.Trim('"',' ').Trim() } }
+    else{ return @($s) }
+  }
+  elseif($x -is [System.Collections.IEnumerable] -and -not ($x -is [string])){
+    $o=@(); foreach($e in $x){ $o+=@("$e") }; return $o
+  }
+  else{ return @("$x") }
 }
+
+# 正規化
+$files = To-StringArray $InputCsvs
+$tags  = To-StringArray $Tags
+
+# フルパス化＆存在チェック
+$files = $files | ForEach-Object {
+  $p = $_
+  if(-not (Test-Path $p)){ throw "CSV not found: $p" }
+  (Resolve-Path $p).Path
+}
+
+if($files.Count -ne $tags.Count){
+  throw "Files($($files.Count)) と Tags($($tags.Count)) の数が一致しません。"
+}
+
+$ErrorActionPreference = 'Stop'
 
 # すべてのヘッダーの和集合を作る（大文字小文字は区別しない）
 $cmp = [System.StringComparer]::OrdinalIgnoreCase
