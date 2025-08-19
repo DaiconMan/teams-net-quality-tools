@@ -1,5 +1,6 @@
+
 <#
-Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放)
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放・メモリ対策版)
 
 機能:
 - teams_net_quality.csv を集計し、同一Excelブックに以下を出力
@@ -7,7 +8,8 @@ Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放)
   2) DeltaSeries: 上記の区間差(Δ) = L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN
   3) ホスト別シート: targets.csv の各行(=ターゲット)ごとに1シート、AP名/BSSID/SSIDからフロアを推定 or floors.csv で色分けし、時系列グラフ＋しきい値線を描画
 - SAAS/Zscaler は ICMPが得られない想定のため TCP/HTTP を優先、L2/L3/RTR* は ICMP を優先
-- PowerShell 純正記法のみ（「if を式として使う」書き方は不使用）
+- 「if を式として使う」書き方は不使用（PS5.1 準拠）
+- Excel への書き込みは**分割（チャンク）**で実施し、**軽量モード**で描画＆再計算を停止（メモリ不足対策）
 
 使い方(例):
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -47,6 +49,22 @@ function Release-Com([object]$obj){
   if($null -ne $obj -and [System.Runtime.InteropServices.Marshal]::IsComObject($obj)){
     try{ [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($obj) }catch{}
   }
+}
+
+function Set-ExcelPerfMode($app, [bool]$on){
+  try{
+    if($on){
+      $app.ScreenUpdating = $false
+      $app.DisplayStatusBar = $false
+      $app.EnableEvents = $false
+      $app.Calculation = -4135   # xlCalculationManual
+    } else {
+      $app.Calculation = -4105   # xlCalculationAutomatic
+      $app.EnableEvents = $true
+      $app.ScreenUpdating = $true
+      $app.DisplayStatusBar = $true
+    }
+  }catch{}
 }
 
 function Sanitize-SheetName([string]$name){
@@ -96,13 +114,30 @@ function To-DoubleOrNull($v){
   return $null
 }
 
-function Write-Column2D($ws,[string]$addr,[object[]]$arr){
-  $n = 0
-  if($arr){ $n = [int]$arr.Count }
-  if($n -le 0){ return }
-  $data = New-Object 'object[,]' $n,1
-  for($i=0;$i -lt $n;$i++){ $data[$i,0]=$arr[$i] }
-  $ws.Range($addr).Resize($n,1).Value2 = $data
+# 分割書き込み（メモリ節約版）
+function Write-Column2D($ws,[string]$addr,[System.Collections.IEnumerable]$seq,[int]$ChunkSize=20000){
+  if ($null -eq $seq) { return }
+  $start = $ws.Range($addr)
+  $buf = New-Object 'object[,]' $ChunkSize, 1
+  $i = 0
+  foreach($item in $seq){
+    $buf[$i,0] = $item
+    $i++
+    if ($i -ge $ChunkSize){
+      # 使った分だけ切り出して書く
+      $tail = New-Object 'object[,]' $i, 1
+      for($r=0;$r -lt $i;$r++){ $tail[$r,0] = $buf[$r,0] }
+      $start.Resize($i,1).Value2 = $tail
+      $start = $start.Offset($i, 0)
+      $i = 0
+      [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    }
+  }
+  if ($i -gt 0){
+    $tail = New-Object 'object[,]' $i, 1
+    for($r=0;$r -lt $i;$r++){ $tail[$r,0] = $buf[$r,0] }
+    $start.Resize($i,1).Value2 = $tail
+  }
 }
 
 function New-RepeatedArray([object]$value,[int]$count){
@@ -286,6 +321,7 @@ foreach($r in $roleOrderAll){ if(Test-MapHasKey $roleKeys $r){ $roleOrder += $r 
 
 # bucket(double OAdate) -> role -> List<double>
 $buckets=@{}
+$X=@()
 
 foreach($row in $data){
   $hraw = ''+$row.$colHost; if(-not $hraw){ continue }
@@ -310,7 +346,7 @@ foreach($row in $data){
 }
 
 # 平均＆Δ系列
-$X=@(); $series=@{}; foreach($r in $roleOrder){ $series[$r]=@() }
+$series=@{}; foreach($r in $roleOrder){ $series[$r]=@() }
 $DeltaNames=@('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD'); $delta=@{}; foreach($d in $DeltaNames){ $delta[$d]=@() }
 $keys=@($buckets.Keys) | Sort-Object {[double]$_}
 foreach($k in $keys){
@@ -351,6 +387,8 @@ try{
   $excel = New-Object -ComObject Excel.Application
   $excel.Visible=[bool]$Visible
   $excel.DisplayAlerts=$false
+  Set-ExcelPerfMode $excel $true
+
   $wb = $excel.Workbooks.Add()
   while($wb.Worksheets.Count -gt 1){ $wb.Worksheets.Item(1).Delete() }
 
@@ -359,16 +397,13 @@ try{
     $ws1=$wb.Worksheets.Item(1); $ws1.Name='LayerSeries'
     $n=$X.Count
     $ws1.Cells(1,1).Value2='timestamp'
-    $arrX = New-Object 'object[,]' $n,1
-    for($i=0;$i -lt $n;$i++){ $arrX[$i,0]=$X[$i] }
-    $ws1.Range('A2').Resize($n,1).Value2=$arrX
+    Write-Column2D $ws1 'A2' $X
     $ws1.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
     $col=2
     foreach($r in $roleOrder){
       $ws1.Cells(1,$col).Value2=$r
-      $vals=$series[$r]; $arr=New-Object 'object[,]' $n,1
-      for($i=0;$i -lt $n;$i++){ $arr[$i,0]=$vals[$i] }
-      $ws1.Range($ws1.Cells(2,$col),$ws1.Cells(1+$n,$col)).Value2=$arr
+      $vals=$series[$r]
+      Write-Column2D $ws1 ($ws1.Cells(2,$col).Address()) $vals
       $col++
     }
     $ws1.Columns.AutoFit() | Out-Null
@@ -390,14 +425,13 @@ try{
     # ---- DeltaSeries ----
     $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
-    $ws2.Range('A2').Resize($n,1).Value2=$arrX
+    Write-Column2D $ws2 'A2' $X
     $ws2.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
     $col=2
     foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
       $ws2.Cells(1,$col).Value2=$d
-      $vals=$delta[$d]; $arr=New-Object 'object[,]' $n,1
-      for($i=0;$i -lt $n;$i++){ $arr[$i,0]=$vals[$i] }
-      $ws2.Range($ws2.Cells(2,$col),$ws2.Cells(1+$n,$col)).Value2=$arr
+      $vals=$delta[$d]
+      Write-Column2D $ws2 ($ws2.Cells(2,$col).Address()) $vals
       $col++
     }
     $ws2.Columns.AutoFit() | Out-Null
@@ -540,6 +574,9 @@ try{
     }catch{}
 
     $created += $ws.Name
+
+    # 大きなシートを作るたびに軽くGC（メモリ安定化）
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   }
 
   # ---- INDEX ----
@@ -562,6 +599,7 @@ catch{
   throw
 }
 finally{
+  try{ Set-ExcelPerfMode $excel $false }catch{}
   if($wb){ try{ $wb.Close($false) }catch{}; Release-Com $wb; $wb=$null }
   if($excel){ try{ $excel.Quit() }catch{}; Release-Com $excel; $excel=$null }
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
