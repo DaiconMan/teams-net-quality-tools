@@ -126,6 +126,19 @@ function Sub-OrNull($a,$b){
   return $null
 }
 
+# Hashtable/OrderedDictionary/Dictionary などで安全にキー存在確認
+function Test-MapHasKey($map, $key){
+  if ($null -eq $map) { return $false }
+  try {
+    $methods = $map.PSObject.Methods.Name
+  } catch {
+    try { return ($map.Keys -contains $key) } catch { return $false }
+  }
+  if ($methods -contains 'ContainsKey') { return [bool]$map.ContainsKey($key) }
+  if ($methods -contains 'Contains')    { return [bool]$map.Contains($key) }
+  try { return ($map.Keys -contains $key) } catch { return $false }
+}
+
 # ---------------- CSV 読み込み ----------------
 if(-not (Test-Path $CsvPath)){ throw "CSV not found: $CsvPath" }
 $data = Import-Csv -Path $CsvPath -Encoding UTF8
@@ -134,8 +147,14 @@ if(-not $data -or $data.Count -eq 0){ throw "CSV is empty: $CsvPath" }
 # 列解決（表記ゆれ対応）
 $headers=@{}; $data[0].PSObject.Properties.Name | ForEach-Object { $headers[$_.ToLowerInvariant()] = $_ }
 function Resolve-Col([string[]]$cands){
-  foreach($c in $cands){ if($headers.ContainsKey($c)){ return $headers[$c] } }
-  foreach($c in $cands){ foreach($k in $headers.Keys){ if($k -like "*$c*"){ return $headers[$k] } } }
+  foreach($c in $cands){
+    if(Test-MapHasKey $headers $c){ return $headers[$c] }
+  }
+  foreach($c in $cands){
+    foreach($k in $headers.Keys){
+      if($k -like "*$c*"){ return $headers[$k] }
+    }
+  }
   return $null
 }
 $colHost = Resolve-Col @('host','hostname','target','dst_host','dest','remote_host'); if(-not $colHost){ throw "host column not found" }
@@ -202,7 +221,7 @@ $targets = Parse-TargetsCsv $TargetsCsv
 # 役割→targets
 $roleKeys=@{}
 foreach($t in $targets){
-  if(-not $roleKeys.ContainsKey($t.Role)){ $roleKeys[$t.Role] = New-Object System.Collections.Generic.List[object] }
+  if(-not (Test-MapHasKey $roleKeys $t.Role)){ $roleKeys[$t.Role] = New-Object System.Collections.Generic.List[object] }
   $roleKeys[$t.Role].Add($t)
 }
 
@@ -221,11 +240,11 @@ if($FloorMap -and (Test-Path $FloorMap)){
 function Guess-Floor([string]$apName,[string]$bssid,[string]$ssid){
   if($bssid){
     $k="bssid::"+$bssid.ToLowerInvariant()
-    if($floorMap.ContainsKey($k)){ return $floorMap[$k] }
+    if(Test-MapHasKey $floorMap $k){ return $floorMap[$k] }
   }
   if($apName){
     $k="ap::"+$apName.ToLowerInvariant()
-    if($floorMap.ContainsKey($k)){ return $floorMap[$k] }
+    if(Test-MapHasKey $floorMap $k){ return $floorMap[$k] }
   }
   foreach($c in @($apName,$ssid)){
     $s=(''+$c)
@@ -260,8 +279,13 @@ if($BucketMinutes -lt 1){ $BucketMinutes=5 }
 $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
 
-$roleOrder = @('L2','L3','RTR_LAN','RTR_WAN','ZSCALER','SAAS') | Where-Object { $roleKeys.ContainsKey($_) }
-$buckets=@{} # bucket(double OAdate) -> role -> List<double>
+# 存在する役割のみを順序付きで採用
+$roleOrderAll = @('L2','L3','RTR_LAN','RTR_WAN','ZSCALER','SAAS')
+$roleOrder=@()
+foreach($r in $roleOrderAll){ if(Test-MapHasKey $roleKeys $r){ $roleOrder += $r } }
+
+# bucket(double OAdate) -> role -> List<double>
+$buckets=@{}
 
 foreach($row in $data){
   $hraw = ''+$row.$colHost; if(-not $hraw){ continue }
@@ -279,8 +303,8 @@ foreach($row in $data){
     if(-not $matched){ continue }
     $pair = Pick-EffRtt $r $row
     $val = $pair[0]; if($val -eq $null){ continue }
-    if(-not $buckets.ContainsKey($bucket)){ $buckets[$bucket]=@{} }
-    if(-not $buckets[$bucket].ContainsKey($r)){ $buckets[$bucket][$r]=New-Object System.Collections.Generic.List[double] }
+    if(-not (Test-MapHasKey $buckets $bucket)){ $buckets[$bucket]=@{} }
+    if(-not (Test-MapHasKey $buckets[$bucket] $r)){ $buckets[$bucket][$r]=New-Object System.Collections.Generic.List[double] }
     $buckets[$bucket][$r].Add([double]$val)
   }
 }
@@ -293,7 +317,7 @@ foreach($k in $keys){
   $X += [double]$k
   $valsThis=@{}
   foreach($r in $roleOrder){
-    if($buckets[$k].ContainsKey($r)){
+    if(Test-MapHasKey $buckets[$k] $r){
       $arr=$buckets[$k][$r].ToArray()
       [double]$avg = ($arr | Measure-Object -Average).Average
       $series[$r] += [double]$avg
@@ -303,11 +327,11 @@ foreach($k in $keys){
       $valsThis[$r]=$null
     }
   }
-  $l2  = $null; if($valsThis.ContainsKey('L2'))      { $l2  = $valsThis['L2'] }
-  $l3  = $null; if($valsThis.ContainsKey('L3'))      { $l3  = $valsThis['L3'] }
-  $lan = $null; if($valsThis.ContainsKey('RTR_LAN')) { $lan = $valsThis['RTR_LAN'] }
-  $wan = $null; if($valsThis.ContainsKey('RTR_WAN')) { $wan = $valsThis['RTR_WAN'] }
-  $saas= $null; if($valsThis.ContainsKey('SAAS'))    { $saas= $valsThis['SAAS'] }
+  $l2  = $null; if(Test-MapHasKey $valsThis 'L2')      { $l2  = $valsThis['L2'] }
+  $l3  = $null; if(Test-MapHasKey $valsThis 'L3')      { $l3  = $valsThis['L3'] }
+  $lan = $null; if(Test-MapHasKey $valsThis 'RTR_LAN') { $lan = $valsThis['RTR_LAN'] }
+  $wan = $null; if(Test-MapHasKey $valsThis 'RTR_WAN') { $wan = $valsThis['RTR_WAN'] }
+  $saas= $null; if(Test-MapHasKey $valsThis 'SAAS')    { $saas= $valsThis['SAAS'] }
 
   $delta['DELTA_L3']      += (Sub-OrNull $l3  $l2)
   $delta['DELTA_RTR_LAN'] += (Sub-OrNull $lan $l3)
@@ -338,7 +362,7 @@ try{
     $arrX = New-Object 'object[,]' $n,1
     for($i=0;$i -lt $n;$i++){ $arrX[$i,0]=$X[$i] }
     $ws1.Range('A2').Resize($n,1).Value2=$arrX
-    $ws1.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='yyyy/mm/dd hh:mm'
+    $ws1.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
     $col=2
     foreach($r in $roleOrder){
       $ws1.Cells(1,$col).Value2=$r
@@ -367,7 +391,7 @@ try{
     $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
     $ws2.Range('A2').Resize($n,1).Value2=$arrX
-    $ws2.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='yyyy/mm/dd hh:mm'
+    $ws2.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
     $col=2
     foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
       $ws2.Cells(1,$col).Value2=$d
@@ -439,7 +463,7 @@ try{
       $ssidv  = ''; if ($colSsid)  { $ssidv  = ''+$row.$colSsid }
       $floor  = Guess-Floor $apName $bssid $ssidv
 
-      if(-not $byFloor.ContainsKey($floor)){
+      if(-not (Test-MapHasKey $byFloor $floor)){
         $byFloor[$floor]=@{ times=New-Object System.Collections.Generic.List[double]; vals=New-Object System.Collections.Generic.List[double] }
       }
       $byFloor[$floor].times.Add([double]$x)
@@ -468,7 +492,7 @@ try{
       $ws.Cells(1,$col+1).Value2=("rtt_{0}" -f $fl)
       Write-Column2D $ws ($ws.Cells(2,$col).Address())  $times
       Write-Column2D $ws ($ws.Cells(2,$col+1).Address()) $vals
-      try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$times.Count,$col)).NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
+      try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$times.Count,$col)).NumberFormatLocal='mm/dd hh:mm' }catch{}
       try{ $ws.Range($ws.Cells(2,$col+1),$ws.Cells(1+$times.Count,$col+1)).NumberFormatLocal='0.0' }catch{}
       foreach($xv in $times){ $unionTimes.Add([double]$xv) }
       $col+=2
@@ -481,7 +505,7 @@ try{
     $ws.Cells(1,$col+1).Value2='threshold_ms'
     Write-Column2D $ws ($ws.Cells(2,$col).Address()) $unionSorted
     Write-Column2D $ws ($ws.Cells(2,$col+1).Address()) (New-RepeatedArray -value ([double]$ThresholdMs) -count $unionSorted.Count)
-    try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$unionSorted.Count,$col)).NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
+    try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$unionSorted.Count,$col)).NumberFormatLocal='mm/dd hh:mm' }catch{}
     try{ $ws.Range($ws.Cells(2,$col+1),$ws.Cells(1+$unionSorted.Count,$col+1)).NumberFormatLocal='0.0' }catch{}
 
     # グラフ作成
