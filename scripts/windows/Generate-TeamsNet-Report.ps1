@@ -1,27 +1,37 @@
 <#
 Generate-TeamsNet-Report.ps1
 
-- 既存の teams_net_quality.csv を集計し、同一ブックに以下を出力:
-  1) Host* シート: 各ターゲット(=targets.csvの行)ごとに1シート。フロア(8F/10F等)別に系列を分けて色分けした時系列グラフを作成
-     - SAAS 等でICMP不可でも、役割別に ICMP/TCP/HTTP の優先順位で「有効RTT(eff_rtt_ms)」を採用
-     - 閾値線(既定 100ms, 赤破線)、Y軸 0..300ms, X軸は1時間刻み表示
-  2) LayerSeries/DeltaSeries: L2/L3/RTR_LAN/RTR_WAN/ZSCALER/SAAS の時間バケット平均と、区間差(Δ)のグラフ
+機能:
+- teams_net_quality.csv を集計し、同一Excelブックに以下を出力
+  1) LayerSeries: L2/L3/RTR_LAN/RTR_WAN/ZSCALER/SAAS の時間バケット平均
+  2) DeltaSeries: 上記の区間差(Δ) = L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN
+  3) ホスト別シート: targets.csv の各行(=ターゲット)ごとに1シート、AP名/BSSID/SSIDからフロアを推定 or floors.csv で色分けし、時系列グラフ＋しきい値線を描画
+- SAAS/Zscaler は ICMPが得られない想定のため TCP/HTTP を優先、L2/L3/RTR* は ICMP を優先
+- PowerShell 5.1 互換。Excel COM は必ず Quit/Release する
 
-- PS 5.1 互換。Excelは成功/失敗に関わらず必ず Quit/Release
-- フロア推定: ap_name/bssid/ssid に "8F/8階/10F/10階" などが含まれればその値。なければ Unknown
-- 追加の明示マップがある場合は -FloorMap で bssid,ap_name,floor を与えると優先使用
-
-使い方:
+使い方(例):
   powershell -NoProfile -ExecutionPolicy Bypass `
     -File .\Generate-TeamsNet-Report.ps1 `
     -CsvPath "$Env:LOCALAPPDATA\TeamsNet\teams_net_quality.csv" `
-    -TargetsCsv ".\targets.csv" `
-    -Output ".\TeamsNet-Report.xlsx" `
+    -TargetsCsv "..\targets.csv" `
+    -FloorMap "..\floors.csv" `
+    -Output ".\Output\TeamsNet-Report.xlsx" `
     -BucketMinutes 5 `
-    -ThresholdMs 100 `
-    [-FloorMap .\floors.csv] [-Visible]
+    -ThresholdMs 100
+
+入力:
+- CsvPath: teams_net_quality.csv（少なくとも host/timestamp と ICMP/TCP/HTTP のどれか）
+- TargetsCsv: role,key,label のCSV（{GATEWAY}/{HOP2}/{HOP3} をプレースホルダとして使用可）
+- FloorMap(任意): bssid,ap_name,floor のCSV
+
+出力:
+- Output: Excelブック (LayerSeries, DeltaSeries, 各ターゲットのシート, INDEX)
+
+注意:
+- .ps1 内は PowerShell 構文のみ（CMDの if exist/goto などは一切使用しない）
 #>
 
+[CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$CsvPath,
   [Parameter(Mandatory=$true)][string]$TargetsCsv,
@@ -32,9 +42,9 @@ param(
   [switch]$Visible
 )
 
-# ---------- 共通 ----------
-$ErrorActionPreference='Stop'
-$PSDefaultParameterValues['*:ErrorAction']='Stop'
+# ---------------- 共通設定 ----------------
+$ErrorActionPreference = 'Stop'
+$PSDefaultParameterValues['*:ErrorAction'] = 'Stop'
 
 function Release-Com([object]$obj){
   if($null -ne $obj -and [System.Runtime.InteropServices.Marshal]::IsComObject($obj)){
@@ -62,7 +72,7 @@ function Normalize-Host([string]$s){
 }
 function To-DoubleOrNull($v){
   if($v -is [double]){ return [double]$v }
-  $s = ('' + $v).Trim()
+  $s=(''+$v).Trim()
   if(-not $s){ return $null }
   $d=0.0
   if([double]::TryParse($s,[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$d)){ return [double]$d }
@@ -70,45 +80,50 @@ function To-DoubleOrNull($v){
   return $null
 }
 function Write-Column2D($ws,[string]$addr,[object[]]$arr){
-  [int]$n = if($arr){ [int]$arr.Count } else { 0 }
+  $n = if($arr){ [int]$arr.Count } else { 0 }
   if($n -le 0){ return }
-  $data = New-Object 'object[,]' ([int]$n),([int]1)
+  $data = New-Object 'object[,]' $n,1
   for($i=0;$i -lt $n;$i++){ $data[$i,0]=$arr[$i] }
-  $ws.Range($addr).Resize([int]$n,1).Value2=$data
+  $ws.Range($addr).Resize($n,1).Value2 = $data
 }
 function New-RepeatedArray([object]$value,[int]$count){
   if($count -le 0){ return @() }
-  $count=[int]$count
-  $a=New-Object object[] $count
+  $a = New-Object object[] $count
   for($i=0;$i -lt $count;$i++){ $a[$i]=$value }
   return $a
 }
+function Format-Err([System.Management.Automation.ErrorRecord]$e){
+  $ii=$e.InvocationInfo
+  $parts=@("[ERROR] $($e.FullyQualifiedErrorId)")
+  if($ii){ $parts += " at line $($ii.ScriptLineNumber) char $($ii.OffsetInLine): $($ii.Line)" }
+  $ex=$e.Exception
+  if($ex){ $parts += "$($ex.GetType().FullName): $($ex.Message)" }
+  return ($parts -join "`r`n")
+}
 
-# ---------- CSV 読み込み ----------
+# ---------------- CSV 読み込み ----------------
 if(-not (Test-Path $CsvPath)){ throw "CSV not found: $CsvPath" }
 $data = Import-Csv -Path $CsvPath -Encoding UTF8
 if(-not $data -or $data.Count -eq 0){ throw "CSV is empty: $CsvPath" }
 
 # 列解決（表記ゆれ対応）
-$headers = @{}
-$data[0].PSObject.Properties.Name | ForEach-Object { $headers[$_.ToLowerInvariant()] = $_ }
+$headers=@{}; $data[0].PSObject.Properties.Name | ForEach-Object { $headers[$_.ToLowerInvariant()] = $_ }
 function Resolve-Col([string[]]$cands){
   foreach($c in $cands){ if($headers.ContainsKey($c)){ return $headers[$c] } }
   foreach($c in $cands){ foreach($k in $headers.Keys){ if($k -like "*$c*"){ return $headers[$k] } } }
   return $null
 }
+$colHost = Resolve-Col @('host','hostname','target','dst_host','dest','remote_host'); if(-not $colHost){ throw "host column not found" }
+$colTime = Resolve-Col @('timestamp','time','datetime','date'); if(-not $colTime){ throw "timestamp column not found" }
+$colIcmp = Resolve-Col @('icmp_avg_ms','rtt_ms','avg_rtt','avg_rtt_ms','icmp_avg','icmp_rtt_ms')
+$colTcp  = Resolve-Col @('tcp_ms','tcp_connect_ms','tcp443_ms')
+$colHttp = Resolve-Col @('http_ms','http_head_ms','http_head_rtt_ms')
+$colDns  = Resolve-Col @('dns_ms','dns_lookup_ms','dns_rtt_ms')
+$colSsid = Resolve-Col @('ssid')
+$colBssid= Resolve-Col @('bssid','ap_bssid')
+$colAp   = Resolve-Col @('ap','ap_name','ap_label','ap_hostname')
 
-$hn = Resolve-Col @('host','hostname','target','dst_host','dest','remote_host'); if(-not $hn){ throw "host column not found" }
-$tn = Resolve-Col @('timestamp','time','datetime','date'); if(-not $tn){ throw "timestamp column not found" }
-$in = Resolve-Col @('icmp_avg_ms','rtt_ms','avg_rtt','avg_rtt_ms','icmp_avg','icmp_rtt_ms')
-$tc = Resolve-Col @('tcp_ms','tcp_connect_ms','tcp443_ms')
-$ht = Resolve-Col @('http_ms','http_head_ms','http_head_rtt_ms')
-$dn = Resolve-Col @('dns_ms','dns_lookup_ms','dns_rtt_ms')
-$ss = Resolve-Col @('ssid')
-$bs = Resolve-Col @('bssid','ap_bssid')
-$ap = Resolve-Col @('ap','ap_name','ap_label','ap_hostname')
-
-# ---------- targets.csv 読み込み ----------
+# ---------------- targets.csv 読み込み ----------------
 function Get-DefaultGatewayIPv4(){
   try{
     $gw = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
@@ -130,25 +145,21 @@ function Parse-TargetsCsv([string]$path){
   if(-not (Test-Path $path)){ throw "targets.csv not found: $path" }
   $rows = Import-Csv -Path $path -Encoding UTF8
   if(-not $rows -or $rows.Count -eq 0){ throw "targets.csv is empty: $path" }
-
   $gw = Get-DefaultGatewayIPv4
   $hop2 = Get-HopN 2
   $hop3 = Get-HopN 3
-
   $list = New-Object System.Collections.Generic.List[object]
   foreach($r in $rows){
-    $role  = ('' + $r.role).Trim().ToUpperInvariant()
-    $key   = ('' + $r.key ).Trim()
-    $label = ('' + $r.label).Trim()
+    $role  = (''+$r.role).Trim().ToUpperInvariant()
+    $key   = (''+$r.key ).Trim()
+    $label = (''+$r.label).Trim()
     if(-not $role -or -not $key){ continue }
-
     if($key -eq '{GATEWAY}' -and $gw){ $key=$gw }
     if($key -eq '{HOP2}'    -and $hop2){ $key=$hop2 }
     if($key -eq '{HOP3}'    -and $hop3){ $key=$hop3 }
-
     $list.Add([pscustomobject]@{
       Role = $role
-      Key  = $key
+      Key = $key
       KeyNorm = Normalize-Host $key
       Label = (if($label){ $label } else { $key })
     })
@@ -157,51 +168,54 @@ function Parse-TargetsCsv([string]$path){
   return $list
 }
 $targets = Parse-TargetsCsv $TargetsCsv
+
 # 役割→targets
-$roleKeys = @{}
+$roleKeys=@{}
 foreach($t in $targets){
   if(-not $roleKeys.ContainsKey($t.Role)){ $roleKeys[$t.Role] = New-Object System.Collections.Generic.List[object] }
   $roleKeys[$t.Role].Add($t)
 }
 
-# ---------- フロア判定 ----------
-$floorMapHash = @{}
+# ---------------- フロア判定 ----------------
+$floorMap=@{}
 if($FloorMap -and (Test-Path $FloorMap)){
   $fm = Import-Csv -Path $FloorMap -Encoding UTF8
   foreach($r in $fm){
     $b=(''+$r.bssid).ToLowerInvariant()
     $an=(''+$r.ap_name).ToLowerInvariant()
     $f=(''+$r.floor).Trim()
-    if($b){ $floorMapHash["bssid::$b"]=$f }
-    if($an){ $floorMapHash["ap::$an"]=$f }
+    if($b){ $floorMap["bssid::$b"]=$f }
+    if($an){ $floorMap["ap::$an"]=$f }
   }
 }
 function Guess-Floor([string]$apName,[string]$bssid,[string]$ssid){
-  $key=''
-  if($bssid){ $key="bssid::"+$bssid.ToLowerInvariant(); if($floorMapHash.ContainsKey($key)){ return $floorMapHash[$key] } }
-  if($apName){ $key="ap::"+$apName.ToLowerInvariant(); if($floorMapHash.ContainsKey($key)){ return $floorMapHash[$key] } }
-
-  $candidates = @($apName,$ssid)
-  foreach($c in $candidates){
+  if($bssid){
+    $k="bssid::"+$bssid.ToLowerInvariant()
+    if($floorMap.ContainsKey($k)){ return $floorMap[$k] }
+  }
+  if($apName){
+    $k="ap::"+$apName.ToLowerInvariant()
+    if($floorMap.ContainsKey($k)){ return $floorMap[$k] }
+  }
+  foreach($c in @($apName,$ssid)){
     $s=(''+$c)
     if([string]::IsNullOrWhiteSpace($s)){ continue }
-    $m = [regex]::Match($s,'(?i)\b(\d{1,2})\s*(?:f|階)\b')
+    $m=[regex]::Match($s,'(?i)\b(\d{1,2})\s*(?:f|階)\b')
     if($m.Success){ return ($m.Groups[1].Value + 'F') }
   }
   return 'Unknown'
 }
 
-# ---------- 有効RTT選択（役割別） ----------
-function Pick-EffRtt([string]$role, [object]$row){
-  $icmp = if($in){ To-DoubleOrNull $row.$in } else { $null }
-  $tcp  = if($tc){ To-DoubleOrNull $row.$tc } else { $null }
-  $http = if($ht){ To-DoubleOrNull $row.$ht } else { $null }
-
+# ---------------- 有効RTT 選択（役割別） ----------------
+function Pick-EffRtt([string]$role,[object]$row){
+  $icmp = if($colIcmp){ To-DoubleOrNull $row.$colIcmp } else { $null }
+  $tcp  = if($colTcp ){ To-DoubleOrNull $row.$colTcp  } else { $null }
+  $http = if($colHttp){ To-DoubleOrNull $row.$colHttp } else { $null }
   if($role -like 'RTR*' -or $role -eq 'L2' -or $role -eq 'L3'){
     if($icmp -ne $null){ return ,@($icmp,'icmp') }
     if($tcp  -ne $null){ return ,@($tcp ,'tcp') }
     if($http -ne $null){ return ,@($http,'http') }
-  } else { # SAAS/ZSCALER/その他
+  } else {
     if($tcp  -ne $null){ return ,@($tcp ,'tcp') }
     if($http -ne $null){ return ,@($http,'http') }
     if($icmp -ne $null){ return ,@($icmp,'icmp') }
@@ -209,40 +223,38 @@ function Pick-EffRtt([string]$role, [object]$row){
   return ,@($null,'')
 }
 
-# ---------- 集計（Layer用） ----------
-if($BucketMinutes -lt 1){ $BucketMinutes = 5 }
+# ---------------- 集計（Layer 用） ----------------
+if($BucketMinutes -lt 1){ $BucketMinutes=5 }
 [double]$frac = [double]$BucketMinutes / 1440.0
 $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
 
 $roleOrder = @('L2','L3','RTR_LAN','RTR_WAN','ZSCALER','SAAS') | Where-Object { $roleKeys.ContainsKey($_) }
-
-$buckets = @{}  # bucket -> role -> List<double>
+$buckets=@{} # bucket(double OAdate) -> role -> List<double>
 
 foreach($row in $data){
-  $hraw = '' + $row.$hn; if(-not $hraw){ continue }
+  $hraw = ''+$row.$colHost; if(-not $hraw){ continue }
   $hnorm = Normalize-Host $hraw
-  $ts = '' + $row.$tn; if(-not $ts){ continue }
+  $ts = ''+$row.$colTime; if(-not $ts){ continue }
   try{ $dt=[datetime]::Parse($ts,$ciCur) }catch{ try{ $dt=[datetime]::Parse($ts,$ciInv) }catch{ continue } }
   [double]$tOa = $dt.ToOADate()
   [double]$bucket = [math]::Floor($tOa / $frac) * $frac
 
-  foreach($role in $roleOrder){
+  foreach($r in $roleOrder){
     $matched=$false
-    foreach($t in $roleKeys[$role]){
+    foreach($t in $roleKeys[$r]){
       if($hnorm -eq $t.KeyNorm -or $hnorm.Contains($t.KeyNorm) -or $t.KeyNorm.Contains($hnorm)){ $matched=$true; break }
     }
     if(-not $matched){ continue }
-    $pair = Pick-EffRtt $role $row
+    $pair = Pick-EffRtt $r $row
     $val = $pair[0]; if($val -eq $null){ continue }
     if(-not $buckets.ContainsKey($bucket)){ $buckets[$bucket]=@{} }
-    if(-not $buckets[$bucket].ContainsKey($role)){ $buckets[$bucket][$role]=New-Object System.Collections.Generic.List[double] }
-    $buckets[$bucket][$role].Add([double]$val)
+    if(-not $buckets[$bucket].ContainsKey($r)){ $buckets[$bucket][$r]=New-Object System.Collections.Generic.List[double] }
+    $buckets[$bucket][$r].Add([double]$val)
   }
 }
-if($buckets.Count -eq 0){ Write-Warning "No layer data matched targets.csv"; }
 
-# 平均系列とΔ
+# 平均＆Δ系列
 $X=@(); $series=@{}; foreach($r in $roleOrder){ $series[$r]=@() }
 $DeltaNames=@('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD'); $delta=@{}; foreach($d in $DeltaNames){ $delta[$d]=@() }
 $keys=@($buckets.Keys) | Sort-Object {[double]$_}
@@ -251,13 +263,13 @@ foreach($k in $keys){
   $valsThis=@{}
   foreach($r in $roleOrder){
     if($buckets[$k].ContainsKey($r)){
-      $arr = $buckets[$k][$r].ToArray()
+      $arr=$buckets[$k][$r].ToArray()
       [double]$avg = ($arr | Measure-Object -Average).Average
       $series[$r] += [double]$avg
-      $valsThis[$r] = [double]$avg
-    } else {
+      $valsThis[$r]=[double]$avg
+    }else{
       $series[$r] += $null
-      $valsThis[$r] = $null
+      $valsThis[$r]=$null
     }
   }
   function SubOrNull($a,$b){ if($a -ne $null -and $b -ne $null){ return [double]($a-$b) } else { return $null } }
@@ -272,7 +284,7 @@ foreach($k in $keys){
   $delta['DELTA_CLOUD']   += (SubOrNull $saas $wan)
 }
 
-# ---------- Excel 出力 ----------
+# ---------------- Excel 出力 ----------------
 [int]$xlXYScatterLines=74; [int]$xlLegendBottom=-4107; [int]$xlCategory=1; [int]$xlValue=2; [int]$msoLineDash=4
 $excel=$null; $wb=$null
 try{
@@ -284,7 +296,7 @@ try{
 
   # ---- LayerSeries ----
   if($X.Count -gt 0){
-    $ws1 = $wb.Worksheets.Item(1); $ws1.Name = 'LayerSeries'
+    $ws1=$wb.Worksheets.Item(1); $ws1.Name='LayerSeries'
     $n=$X.Count
     $ws1.Cells(1,1).Value2='timestamp'
     $arrX = New-Object 'object[,]' $n,1
@@ -294,15 +306,14 @@ try{
     $col=2
     foreach($r in $roleOrder){
       $ws1.Cells(1,$col).Value2=$r
-      $vals=$series[$r]
-      $arr = New-Object 'object[,]' $n,1
+      $vals=$series[$r]; $arr=New-Object 'object[,]' $n,1
       for($i=0;$i -lt $n;$i++){ $arr[$i,0]=$vals[$i] }
       $ws1.Range($ws1.Cells(2,$col),$ws1.Cells(1+$n,$col)).Value2=$arr
       $col++
     }
     $ws1.Columns.AutoFit() | Out-Null
-    $ch1 = $ws1.ChartObjects().Add(320,10,900,330)
-    $c1=$ch1.Chart; $c1.ChartType=$xlXYScatterLines; $c1.HasTitle=$true; $c1.ChartTitle.Text='Layer RTT (bucket avg)'; $c1.Legend.Position=$xlLegendBottom
+    $ch1=$ws1.ChartObjects().Add(320,10,900,330); $c1=$ch1.Chart
+    $c1.ChartType=$xlXYScatterLines; $c1.HasTitle=$true; $c1.ChartTitle.Text='Layer RTT (bucket avg)'; $c1.Legend.Position=$xlLegendBottom
     try{ $c1.SeriesCollection().Delete() }catch{}
     $endRow=1+$n; $sCol=2
     foreach($r in $roleOrder){
@@ -317,27 +328,26 @@ try{
       $x=$c1.Axes($xlCategory); $x.MajorUnit=(1.0/24.0); $x.TickLabels.NumberFormat='mm/dd hh:mm'
     }catch{}
     # ---- DeltaSeries ----
-    $ws2 = $wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
+    $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
     $ws2.Range('A2').Resize($n,1).Value2=$arrX
     $ws2.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='yyyy/mm/dd hh:mm'
     $col=2
-    foreach($dName in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
-      $ws2.Cells(1,$col).Value2=$dName
-      $vals=$delta[$dName]
-      $arr = New-Object 'object[,]' $n,1
+    foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
+      $ws2.Cells(1,$col).Value2=$d
+      $vals=$delta[$d]; $arr=New-Object 'object[,]' $n,1
       for($i=0;$i -lt $n;$i++){ $arr[$i,0]=$vals[$i] }
       $ws2.Range($ws2.Cells(2,$col),$ws2.Cells(1+$n,$col)).Value2=$arr
       $col++
     }
     $ws2.Columns.AutoFit() | Out-Null
-    $ch2 = $ws2.ChartObjects().Add(320,10,900,330)
-    $c2=$ch2.Chart; $c2.ChartType=$xlXYScatterLines; $c2.HasTitle=$true; $c2.ChartTitle.Text='Layer Δ (bucket avg)'; $c2.Legend.Position=$xlLegendBottom
+    $ch2=$ws2.ChartObjects().Add(320,10,900,330); $c2=$ch2.Chart
+    $c2.ChartType=$xlXYScatterLines; $c2.HasTitle=$true; $c2.ChartTitle.Text='Layer Δ (bucket avg)'; $c2.Legend.Position=$xlLegendBottom
     try{ $c2.SeriesCollection().Delete() }catch{}
     $endRow=1+$n; $sCol=2
-    foreach($dName in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
+    foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
       $s=$c2.SeriesCollection().NewSeries()
-      $s.Name=$dName
+      $s.Name=$d
       $s.XValues=$ws2.Range(("A2:A{0}" -f $endRow))
       $s.Values =$ws2.Range(($ws2.Cells(2,$sCol).Address()+":"+$ws2.Cells($endRow,$sCol).Address()))
       $sCol++
@@ -347,46 +357,50 @@ try{
       $x=$c2.Axes($xlCategory); $x.MajorUnit=(1.0/24.0); $x.TickLabels.NumberFormat='mm/dd hh:mm'
     }catch{}
   } else {
-    # Xがない場合でも後続の HostSheets は作る
-    $wb.Worksheets.Item(1).Name = 'INDEX'
+    $wb.Worksheets.Item(1).Name='INDEX'
   }
 
-  # ---- HostSheets（ターゲットごと & フロア別系列）----
+  # ---- ホスト別シート（フロア色分け） ----
   function Ensure-UniqueSheetName($wb,[string]$base){
-    $sn = Sanitize-SheetName $base
+    $sn=Sanitize-SheetName $base
     $orig=$sn; $i=2
     while($true){
-      try{ $null=$wb.Worksheets.Item($sn); $sn = Sanitize-SheetName ($orig+"_"+$i); $i++ }catch{ break }
+      $exists=$false
+      for($ix=1;$ix -le $wb.Worksheets.Count;$ix++){
+        if($wb.Worksheets.Item($ix).Name -eq $sn){ $exists=$true; break }
+      }
+      if(-not $exists){ break }
+      $sn=Sanitize-SheetName ($orig+"_"+$i); $i++
     }
     return $sn
   }
 
   $created=@()
   foreach($t in $targets){
-    # このターゲットにマッチする行を抽出
-    $rows = @()
+    # 該当行抽出
+    $rows=@()
     foreach($row in $data){
-      $hraw = '' + $row.$hn; if(-not $hraw){ continue }
-      $hnorm = Normalize-Host $hraw
+      $hraw=''+$row.$colHost; if(-not $hraw){ continue }
+      $hnorm=Normalize-Host $hraw
       if($hnorm -eq $t.KeyNorm -or $hnorm.Contains($t.KeyNorm) -or $t.KeyNorm.Contains($hnorm)){
-        $rows += ,$row
+        $rows+=,$row
       }
     }
     if($rows.Count -eq 0){ continue }
 
-    # フロア別に X/Y を構築（役割に応じ有効RTT採用）
-    $byFloor = @{} # floor -> @{ times = List<double>; vals = List<double> }
+    # floor -> { times(List<double>), vals(List<double>) }
+    $byFloor=@{}
     foreach($row in $rows){
-      $ts = '' + $row.$tn; if(-not $ts){ continue }
+      $ts=''+$row.$colTime; if(-not $ts){ continue }
       try{ $dt=[datetime]::Parse($ts,$ciCur) }catch{ try{ $dt=[datetime]::Parse($ts,$ciInv) }catch{ continue } }
-      [double]$x = $dt.ToOADate()
-      $pair = Pick-EffRtt $t.Role $row
-      $y = $pair[0]; if($y -eq $null){ continue }
+      [double]$x=$dt.ToOADate()
+      $pair=Pick-EffRtt $t.Role $row
+      $y=$pair[0]; if($y -eq $null){ continue }
 
-      $apName = if($ap){ ''+$row.$ap } else { '' }
-      $bssid  = if($bs){ ''+$row.$bs } else { '' }
-      $ssidv  = if($ss){ ''+$row.$ss } else { '' }
-      $floor = Guess-Floor $apName $bssid $ssidv
+      $apName = if($colAp){ ''+$row.$colAp } else { '' }
+      $bssid  = if($colBssid){ ''+$row.$colBssid } else { '' }
+      $ssidv  = if($colSsid){ ''+$row.$colSsid } else { '' }
+      $floor  = Guess-Floor $apName $bssid $ssidv
 
       if(-not $byFloor.ContainsKey($floor)){
         $byFloor[$floor]=@{ times=New-Object System.Collections.Generic.List[double]; vals=New-Object System.Collections.Generic.List[double] }
@@ -394,68 +408,65 @@ try{
       $byFloor[$floor].times.Add([double]$x)
       $byFloor[$floor].vals.Add([double]$y)
     }
-
     if($byFloor.Keys.Count -eq 0){ continue }
 
-    $sn = Ensure-UniqueSheetName $wb $t.Label
-    $ws = $wb.Worksheets.Add()
-    $ws.Name = $sn
+    $ws=$wb.Worksheets.Add()
+    $ws.Name = Ensure-UniqueSheetName $wb $t.Label
 
-    # カラム配置: floorごとに 2列(pair) → time_X, rtt_X ... 最後に time_all, threshold
-    $col = 1
-    $floorList = @($byFloor.Keys) | Sort-Object
+    # 各フロア列を書き出し（time_X, rtt_X）
+    $col=1
+    $floorList=@($byFloor.Keys) | Sort-Object
     $unionTimes = New-Object System.Collections.Generic.List[double]
     foreach($fl in $floorList){
-      $times = @($byFloor[$fl].times.ToArray()) | Sort-Object
-      $vals  = @($byFloor[$fl].vals.ToArray())  | Sort-Object @{Expression={$times.IndexOf($_)}} # 安全側: 同じ順で
-
-      # 再ソート: times と vals を同じ順に（簡易にpair再構築）
+      # ペア化して時刻で整列（X/Y同期）
       $pairs=@()
-      for($i=0;$i -lt $times.Count;$i++){ $pairs += [pscustomobject]@{ t=[double]$byFloor[$fl].times[$i]; r=[double]$byFloor[$fl].vals[$i] } }
+      for($i=0;$i -lt $byFloor[$fl].times.Count;$i++){
+        $pairs += [pscustomobject]@{ t=[double]$byFloor[$fl].times[$i]; r=[double]$byFloor[$fl].vals[$i] }
+      }
       $pairs = $pairs | Sort-Object t
-      $times = @(); $vals=@()
+      $times=@(); $vals=@()
       foreach($p in $pairs){ $times += [double]$p.t; $vals += [double]$p.r }
 
-      $ws.Cells(1,$col).Value2=("time_{0}" -f $fl); $ws.Cells(1,$col+1).Value2=("rtt_{0}" -f $fl)
+      $ws.Cells(1,$col).Value2=("time_{0}" -f $fl)
+      $ws.Cells(1,$col+1).Value2=("rtt_{0}" -f $fl)
       Write-Column2D $ws ($ws.Cells(2,$col).Address())  $times
       Write-Column2D $ws ($ws.Cells(2,$col+1).Address()) $vals
       try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$times.Count,$col)).NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
       try{ $ws.Range($ws.Cells(2,$col+1),$ws.Cells(1+$times.Count,$col+1)).NumberFormatLocal='0.0' }catch{}
-      $col += 2
-
-      foreach($x in $times){ $unionTimes.Add([double]$x) }
+      foreach($xv in $times){ $unionTimes.Add([double]$xv) }
+      $col+=2
     }
     $ws.Columns.AutoFit() | Out-Null
 
-    # 閾値列（unionTimes で）
-    $unionSorted = @($unionTimes.ToArray()) | Sort-Object
-    $ws.Cells(1,$col).Value2='time_all'; $ws.Cells(1,$col+1).Value2='threshold_ms'
+    # しきい値シリーズ
+    $unionSorted=@($unionTimes.ToArray()) | Sort-Object
+    $ws.Cells(1,$col).Value2='time_all'
+    $ws.Cells(1,$col+1).Value2='threshold_ms'
     Write-Column2D $ws ($ws.Cells(2,$col).Address()) $unionSorted
     Write-Column2D $ws ($ws.Cells(2,$col+1).Address()) (New-RepeatedArray -value ([double]$ThresholdMs) -count $unionSorted.Count)
     try{ $ws.Range($ws.Cells(2,$col),$ws.Cells(1+$unionSorted.Count,$col)).NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
     try{ $ws.Range($ws.Cells(2,$col+1),$ws.Cells(1+$unionSorted.Count,$col+1)).NumberFormatLocal='0.0' }catch{}
 
-    # グラフ
-    $ch=$ws.ChartObjects().Add(320,10,900,330)
-    $c=$ch.Chart; $c.ChartType=$xlXYScatterLines; $c.HasTitle=$true
-    $c.ChartTitle.Text = ("{0} - RTT by Floor" -f $t.Label)
+    # グラフ作成
+    $ch=$ws.ChartObjects().Add(320,10,900,330); $c=$ch.Chart
+    $c.ChartType=$xlXYScatterLines; $c.HasTitle=$true
+    $c.ChartTitle.Text=("{0} - RTT by Floor" -f $t.Label)
     $c.Legend.Position=$xlLegendBottom
     try{ $c.SeriesCollection().Delete() }catch{}
 
-    # フロア系列
     $colIdx=1
     foreach($fl in $floorList){
       $s=$c.SeriesCollection().NewSeries()
       $s.Name=("RTT ({0})" -f $fl)
-      # X: colIdx, Y: colIdx+1
-      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row # xlUp=-4162
+      # データ範囲は末尾まで自動検出
+      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row  # xlUp=-4162
       $endRowVal  = ($ws.Cells($ws.Rows.Count,$colIdx+1).End(-4162)).Row
       $endRow = [Math]::Max($endRowTime,$endRowVal)
       $s.XValues=$ws.Range(($ws.Cells(2,$colIdx).Address()+":"+$ws.Cells($endRow,$colIdx).Address()))
       $s.Values =$ws.Range(($ws.Cells(2,$colIdx+1).Address()+":"+$ws.Cells($endRow,$colIdx+1).Address()))
       $colIdx+=2
     }
-    # 閾値系列（最後の2列）
+    # 閾値
     $s2=$c.SeriesCollection().NewSeries()
     $s2.Name=("threshold {0} ms" -f [int]$ThresholdMs)
     $endRow = ($ws.Cells($ws.Rows.Count,$col).End(-4162)).Row
@@ -468,25 +479,26 @@ try{
       $x=$c.Axes($xlCategory); $x.MajorUnit=(1.0/24.0); $x.TickLabels.NumberFormat='mm/dd hh:mm'
     }catch{}
 
-    $created += $sn
+    $created += $ws.Name
   }
 
-  # ---- INDEX シート ----
+  # ---- INDEX ----
   $wsIdx=$wb.Worksheets.Add(); $wsIdx.Name='INDEX'
   $wsIdx.Cells(1,1).Value2='Sheets'
   $r=2
   foreach($w in @('LayerSeries','DeltaSeries')){
-    try{ $null=$wb.Worksheets.Item($w); $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$w'!A1",'',$w) | Out-Null; $r++ }catch{}
+    $exists=$false
+    for($ix=1;$ix -le $wb.Worksheets.Count;$ix++){ if($wb.Worksheets.Item($ix).Name -eq $w){ $exists=$true; break } }
+    if($exists){ $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$w'!A1",'',$w) | Out-Null; $r++ }
   }
-  foreach($sn in $created){
-    $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$sn'!A1",'',$sn) | Out-Null; $r++
-  }
+  foreach($sn in $created){ $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$sn'!A1",'',$sn) | Out-Null; $r++ }
 
+  # 保存
   $wb.SaveAs($Output)
   Write-Host "Output: $Output"
 }
 catch{
-  Write-Error $_
+  Write-Error (Format-Err $_)
   throw
 }
 finally{
