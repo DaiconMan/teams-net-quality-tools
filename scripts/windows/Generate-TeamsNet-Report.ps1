@@ -1,6 +1,5 @@
-
 <#
-Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放・メモリ対策版)
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放・メモリ対策/COM安全化版)
 
 機能:
 - teams_net_quality.csv を集計し、同一Excelブックに以下を出力
@@ -10,6 +9,7 @@ Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放�
 - SAAS/Zscaler は ICMPが得られない想定のため TCP/HTTP を優先、L2/L3/RTR* は ICMP を優先
 - 「if を式として使う」書き方は不使用（PS5.1 準拠）
 - Excel への書き込みは**分割（チャンク）**で実施し、**軽量モード**で描画＆再計算を停止（メモリ不足対策）
+- Write-Column2D が **COM Range / 配列 / 文字列 / 単一値**を自動正規化（System.__ComObject 受け取り時の引数変換エラー回避）
 
 使い方(例):
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -20,14 +20,6 @@ Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放�
     -Output ".\Output\TeamsNet-Report.xlsx" `
     -BucketMinutes 5 `
     -ThresholdMs 100
-
-入力:
-- CsvPath: teams_net_quality.csv（少なくとも host/timestamp と ICMP/TCP/HTTP のどれか）
-- TargetsCsv: role,key,label のCSV（{GATEWAY}/{HOP2}/{HOP3} をプレースホルダとして使用可）
-- FloorMap(任意): bssid,ap_name,floor のCSV
-
-出力:
-- Output: Excelブック (LayerSeries, DeltaSeries, 各ターゲットのシート, INDEX)
 #>
 
 [CmdletBinding()]
@@ -114,29 +106,50 @@ function To-DoubleOrNull($v){
   return $null
 }
 
-# 分割書き込み（メモリ節約版）
-function Write-Column2D($ws,[string]$addr,[System.Collections.IEnumerable]$seq,[int]$ChunkSize=20000){
+# 分割書き込み（メモリ節約＋COM安全化）
+function Write-Column2D($ws,[string]$addr,$seq,[int]$ChunkSize=20000){
   if ($null -eq $seq) { return }
-  $start = $ws.Range($addr)
-  $buf = New-Object 'object[,]' $ChunkSize, 1
-  $i = 0
-  foreach($item in $seq){
-    $buf[$i,0] = $item
-    $i++
-    if ($i -ge $ChunkSize){
-      # 使った分だけ切り出して書く
-      $tail = New-Object 'object[,]' $i, 1
-      for($r=0;$r -lt $i;$r++){ $tail[$r,0] = $buf[$r,0] }
-      $start.Resize($i,1).Value2 = $tail
-      $start = $start.Offset($i, 0)
-      $i = 0
-      [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+
+  # --- $seq を 1 次元 List<object> に正規化 ---
+  $list = New-Object System.Collections.Generic.List[object]
+
+  # COM Range / Variant を受け取った場合
+  if ([System.Runtime.InteropServices.Marshal]::IsComObject($seq)) {
+    try {
+      $v = $seq.Value2
+      if ($null -eq $v) { return }
+      if ($v -is [object[,]]) {
+        $rows=$v.GetLength(0); $cols=$v.GetLength(1)
+        # 1列目を使う（複数列時）
+        for($r=1;$r -le $rows;$r++){ $list.Add($v[$r,1]) }
+      } else {
+        $list.Add($v)
+      }
+    } catch {
+      # 最低限のフォールバック
+      $list.Add((''+$seq))
     }
   }
-  if ($i -gt 0){
-    $tail = New-Object 'object[,]' $i, 1
-    for($r=0;$r -lt $i;$r++){ $tail[$r,0] = $buf[$r,0] }
-    $start.Resize($i,1).Value2 = $tail
+  elseif ($seq -is [System.Collections.IEnumerable] -and -not ($seq -is [string])) {
+    foreach($e in $seq){ $list.Add($e) }
+  }
+  else {
+    $list.Add($seq)
+  }
+
+  $n = $list.Count
+  if ($n -le 0) { return }
+
+  $start = $ws.Range($addr)
+  $idx=0
+  while($idx -lt $n){
+    $take=[Math]::Min($ChunkSize,$n-$idx)
+    $block = New-Object 'object[,]' $take, 1
+    for($r=0;$r -lt $take;$r++){ $block[$r,0]=$list[$idx+$r] }
+    $start.Resize($take,1).Value2 = $block
+    $start = $start.Offset($take, 0)
+    $idx += $take
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   }
 }
 
