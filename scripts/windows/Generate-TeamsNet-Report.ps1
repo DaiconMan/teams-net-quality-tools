@@ -1,15 +1,14 @@
 <#
-Generate-TeamsNet-Report.ps1  (PowerShell 5.1 互換・Excel COMは必ず解放・メモリ対策/COM安全化版)
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 / Excel COM 解放 / メモリ対策 / COM安全化 / 2D配列はGetValue使用)
 
-機能:
-- teams_net_quality.csv を集計し、同一Excelブックに以下を出力
+機能概要:
+- teams_net_quality.csv を集計し、同一Excelブックに:
   1) LayerSeries: L2/L3/RTR_LAN/RTR_WAN/ZSCALER/SAAS の時間バケット平均
   2) DeltaSeries: 上記の区間差(Δ) = L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN
-  3) ホスト別シート: targets.csv の各行(=ターゲット)ごとに1シート、AP名/BSSID/SSIDからフロアを推定 or floors.csv で色分けし、時系列グラフ＋しきい値線を描画
-- SAAS/Zscaler は ICMPが得られない想定のため TCP/HTTP を優先、L2/L3/RTR* は ICMP を優先
-- 「if を式として使う」書き方は不使用（PS5.1 準拠）
-- Excel への書き込みは**分割（チャンク）**で実施し、**軽量モード**で描画＆再計算を停止（メモリ不足対策）
-- Write-Column2D が **COM Range / 配列 / 文字列 / 単一値**を自動正規化（System.__ComObject 受け取り時の引数変換エラー回避）
+  3) ターゲット毎シート: targets.csv に基づき時系列グラフ（フロア別に色分け、閾値線あり）
+- SAAS/Zscaler は ICMP 困難 → TCP/HTTP を優先、L2/L3/RTR* は ICMP 優先
+- Excel への大量書き込みは分割チャンク＋軽量モード
+- 2D 配列参照は .GetValue() を使用（[] インデクサに依存しない）
 
 使い方(例):
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -33,7 +32,7 @@ param(
   [switch]$Visible
 )
 
-# ---------------- 共通設定 ----------------
+# ===== 共通設定 =====
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['*:ErrorAction'] = 'Stop'
 
@@ -42,7 +41,6 @@ function Release-Com([object]$obj){
     try{ [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($obj) }catch{}
   }
 }
-
 function Set-ExcelPerfMode($app, [bool]$on){
   try{
     if($on){
@@ -58,7 +56,6 @@ function Set-ExcelPerfMode($app, [bool]$on){
     }
   }catch{}
 }
-
 function Sanitize-SheetName([string]$name){
   if(-not $name){ return 'Sheet' }
   $n = $name -replace '[:\\/\?\*$begin:math:display$$end:math:display$]','_'
@@ -66,36 +63,28 @@ function Sanitize-SheetName([string]$name){
   if($n -match '^\s*$'){ $n='Sheet' }
   return $n
 }
-
 function Normalize-Host([string]$s){
   if ([string]::IsNullOrWhiteSpace($s)) { return '' }
   $t = $s.Trim().Trim('"',"'").ToLowerInvariant()
   if ([string]::IsNullOrEmpty($t)) { return '' }
-
   if ($t -match '$begin:math:text$([0-9]{1,3}(?:\\.[0-9]{1,3}){3})$end:math:text$') { return $Matches[1] } # name (ipv4)
   if ($t -match '$begin:math:display$([0-9a-f:]+)$end:math:display$')                   { return $Matches[1] } # name [ipv6]
-
   try {
     $uri = $null
     if ([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host) {
       $t = $uri.Host.ToLowerInvariant()
     }
   } catch {}
-
   $t = $t.TrimEnd('.').Trim('[',']')
   if ([string]::IsNullOrEmpty($t)) { return '' }
-
   try {
     $ip = $null
     if ([System.Net.IPAddress]::TryParse($t, [ref]$ip)) { return $t }
   } catch {}
-
   if ($t -match '^(.+?):(\d+)$' -and $t -notmatch '^$begin:math:display$.+$end:math:display$') { $t = $Matches[1] }
   if ($t -match '(^|\s|$begin:math:text$)(\\d{1,3}(?:\\.\\d{1,3}){3})(\\s|$end:math:text$|:|$)') { return $Matches[2] }
-
   return $t
 }
-
 function To-DoubleOrNull($v){
   if($v -is [double]){ return [double]$v }
   $s=(''+$v).Trim()
@@ -106,27 +95,26 @@ function To-DoubleOrNull($v){
   return $null
 }
 
-# 分割書き込み（メモリ節約＋COM安全化）
+# ===== 分割書き込み（COM/配列/単一値すべて正規化）=====
 function Write-Column2D($ws,[string]$addr,$seq,[int]$ChunkSize=20000){
   if ($null -eq $seq) { return }
 
-  # --- $seq を 1 次元 List<object> に正規化 ---
+  # $seq → List<object> に正規化（COM Range/Variant対応）
   $list = New-Object System.Collections.Generic.List[object]
-
-  # COM Range / Variant を受け取った場合
   if ([System.Runtime.InteropServices.Marshal]::IsComObject($seq)) {
     try {
       $v = $seq.Value2
       if ($null -eq $v) { return }
       if ($v -is [object[,]]) {
-        $rows=$v.GetLength(0); $cols=$v.GetLength(1)
-        # 1列目を使う（複数列時）
-        for($r=1;$r -le $rows;$r++){ $list.Add($v[$r,1]) }
+        $r0=$v.GetLowerBound(0); $r1=$v.GetUpperBound(0)
+        $c0=$v.GetLowerBound(1)  # 1列目優先
+        for($r=$r0; $r -le $r1; $r++){
+          $list.Add($v.GetValue($r,$c0))
+        }
       } else {
         $list.Add($v)
       }
     } catch {
-      # 最低限のフォールバック
       $list.Add((''+$seq))
     }
   }
@@ -145,7 +133,7 @@ function Write-Column2D($ws,[string]$addr,$seq,[int]$ChunkSize=20000){
   while($idx -lt $n){
     $take=[Math]::Min($ChunkSize,$n-$idx)
     $block = New-Object 'object[,]' $take, 1
-    for($r=0;$r -lt $take;$r++){ $block[$r,0]=$list[$idx+$r] }
+    for($r=0;$r -lt $take;$r++){ $block.SetValue($list[$idx+$r], $r, 0) }
     $start.Resize($take,1).Value2 = $block
     $start = $start.Offset($take, 0)
     $idx += $take
@@ -159,7 +147,6 @@ function New-RepeatedArray([object]$value,[int]$count){
   for($i=0;$i -lt $count;$i++){ $a[$i]=$value }
   return $a
 }
-
 function Format-Err([System.Management.Automation.ErrorRecord]$e){
   $ii=$e.InvocationInfo
   $parts=@("[ERROR] $($e.FullyQualifiedErrorId)")
@@ -168,41 +155,28 @@ function Format-Err([System.Management.Automation.ErrorRecord]$e){
   if($ex){ $parts += "$($ex.GetType().FullName): $($ex.Message)" }
   return ($parts -join "`r`n")
 }
-
 function Sub-OrNull($a,$b){
   if($a -ne $null -and $b -ne $null){ return [double]($a-$b) }
   return $null
 }
-
-# Hashtable/OrderedDictionary/Dictionary などで安全にキー存在確認
 function Test-MapHasKey($map, $key){
   if ($null -eq $map) { return $false }
-  try {
-    $methods = $map.PSObject.Methods.Name
-  } catch {
-    try { return ($map.Keys -contains $key) } catch { return $false }
-  }
+  try { $methods = $map.PSObject.Methods.Name } catch { try { return ($map.Keys -contains $key) } catch { return $false } }
   if ($methods -contains 'ContainsKey') { return [bool]$map.ContainsKey($key) }
   if ($methods -contains 'Contains')    { return [bool]$map.Contains($key) }
   try { return ($map.Keys -contains $key) } catch { return $false }
 }
 
-# ---------------- CSV 読み込み ----------------
+# ===== CSV 読み込み =====
 if(-not (Test-Path $CsvPath)){ throw "CSV not found: $CsvPath" }
 $data = Import-Csv -Path $CsvPath -Encoding UTF8
 if(-not $data -or $data.Count -eq 0){ throw "CSV is empty: $CsvPath" }
 
-# 列解決（表記ゆれ対応）
+# 列解決
 $headers=@{}; $data[0].PSObject.Properties.Name | ForEach-Object { $headers[$_.ToLowerInvariant()] = $_ }
 function Resolve-Col([string[]]$cands){
-  foreach($c in $cands){
-    if(Test-MapHasKey $headers $c){ return $headers[$c] }
-  }
-  foreach($c in $cands){
-    foreach($k in $headers.Keys){
-      if($k -like "*$c*"){ return $headers[$k] }
-    }
-  }
+  foreach($c in $cands){ if(Test-MapHasKey $headers $c){ return $headers[$c] } }
+  foreach($c in $cands){ foreach($k in $headers.Keys){ if($k -like "*$c*"){ return $headers[$k] } } }
   return $null
 }
 $colHost = Resolve-Col @('host','hostname','target','dst_host','dest','remote_host'); if(-not $colHost){ throw "host column not found" }
@@ -215,7 +189,7 @@ $colSsid = Resolve-Col @('ssid')
 $colBssid= Resolve-Col @('bssid','ap_bssid')
 $colAp   = Resolve-Col @('ap','ap_name','ap_label','ap_hostname')
 
-# ---------------- targets.csv 読み込み ----------------
+# ===== targets.csv =====
 function Get-DefaultGatewayIPv4(){
   try{
     $gw = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
@@ -233,7 +207,6 @@ function Get-HopN([int]$n){
   }catch{}
   return $null
 }
-
 function Parse-TargetsCsv([string]$path){
   if(-not (Test-Path $path)){ throw "targets.csv not found: $path" }
   $rows = Import-Csv -Path $path -Encoding UTF8
@@ -250,10 +223,7 @@ function Parse-TargetsCsv([string]$path){
     if($key -eq '{GATEWAY}' -and $gw){ $key=$gw }
     if($key -eq '{HOP2}'    -and $hop2){ $key=$hop2 }
     if($key -eq '{HOP3}'    -and $hop3){ $key=$hop3 }
-
-    $lab = $key
-    if (-not [string]::IsNullOrWhiteSpace($label)) { $lab = $label }
-
+    $lab = if([string]::IsNullOrWhiteSpace($label)) { $key } else { $label }
     $list.Add([pscustomobject]@{
       Role   = $role
       Key    = $key
@@ -273,7 +243,7 @@ foreach($t in $targets){
   $roleKeys[$t.Role].Add($t)
 }
 
-# ---------------- フロア判定 ----------------
+# ===== フロア判定 =====
 $floorMap=@{}
 if($FloorMap -and (Test-Path $FloorMap)){
   $fm = Import-Csv -Path $FloorMap -Encoding UTF8
@@ -303,37 +273,17 @@ function Guess-Floor([string]$apName,[string]$bssid,[string]$ssid){
   return 'Unknown'
 }
 
-# ---------------- 有効RTT 選択（役割別） ----------------
-function Pick-EffRtt([string]$role,[object]$row){
-  $icmp = $null; if ($colIcmp) { $icmp = To-DoubleOrNull $row.$colIcmp }
-  $tcp  = $null; if ($colTcp ) { $tcp  = To-DoubleOrNull $row.$colTcp  }
-  $http = $null; if ($colHttp) { $http = To-DoubleOrNull $row.$colHttp }
-
-  if($role -like 'RTR*' -or $role -eq 'L2' -or $role -eq 'L3'){
-    if($icmp -ne $null){ return ,@($icmp,'icmp') }
-    if($tcp  -ne $null){ return ,@($tcp ,'tcp') }
-    if($http -ne $null){ return ,@($http,'http') }
-  } else {
-    if($tcp  -ne $null){ return ,@($tcp ,'tcp') }
-    if($http -ne $null){ return ,@($http,'http') }
-    if($icmp -ne $null){ return ,@($icmp,'icmp') }
-  }
-  return ,@($null,'')
-}
-
-# ---------------- 集計（Layer 用） ----------------
+# ===== 集計（Layer）=====
 if($BucketMinutes -lt 1){ $BucketMinutes=5 }
 [double]$frac = [double]$BucketMinutes / 1440.0
 $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
 
-# 存在する役割のみを順序付きで採用
 $roleOrderAll = @('L2','L3','RTR_LAN','RTR_WAN','ZSCALER','SAAS')
 $roleOrder=@()
 foreach($r in $roleOrderAll){ if(Test-MapHasKey $roleKeys $r){ $roleOrder += $r } }
 
-# bucket(double OAdate) -> role -> List<double>
-$buckets=@{}
+$buckets=@{}   # bucketOA -> role -> List<double>
 $X=@()
 
 foreach($row in $data){
@@ -358,7 +308,6 @@ foreach($row in $data){
   }
 }
 
-# 平均＆Δ系列
 $series=@{}; foreach($r in $roleOrder){ $series[$r]=@() }
 $DeltaNames=@('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD'); $delta=@{}; foreach($d in $DeltaNames){ $delta[$d]=@() }
 $keys=@($buckets.Keys) | Sort-Object {[double]$_}
@@ -388,7 +337,7 @@ foreach($k in $keys){
   $delta['DELTA_CLOUD']   += (Sub-OrNull $saas $wan)
 }
 
-# ---------------- Excel 出力 ----------------
+# ===== Excel 出力 =====
 [int]$xlXYScatterLines=74
 [int]$xlLegendBottom=-4107
 [int]$xlCategory=1
@@ -405,7 +354,7 @@ try{
   $wb = $excel.Workbooks.Add()
   while($wb.Worksheets.Count -gt 1){ $wb.Worksheets.Item(1).Delete() }
 
-  # ---- LayerSeries ----
+  # LayerSeries
   if($X.Count -gt 0){
     $ws1=$wb.Worksheets.Item(1); $ws1.Name='LayerSeries'
     $n=$X.Count
@@ -420,6 +369,7 @@ try{
       $col++
     }
     $ws1.Columns.AutoFit() | Out-Null
+
     $ch1=$ws1.ChartObjects().Add(320,10,900,330); $c1=$ch1.Chart
     $c1.ChartType=$xlXYScatterLines; $c1.HasTitle=$true; $c1.ChartTitle.Text='Layer RTT (bucket avg)'; $c1.Legend.Position=$xlLegendBottom
     try{ $c1.SeriesCollection().Delete() }catch{}
@@ -435,7 +385,8 @@ try{
       $v=$c1.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50
       $x=$c1.Axes($xlCategory); $x.MajorUnit=(1.0/24.0); $x.TickLabels.NumberFormat='mm/dd hh:mm'
     }catch{}
-    # ---- DeltaSeries ----
+
+    # DeltaSeries
     $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
     Write-Column2D $ws2 'A2' $X
@@ -467,7 +418,7 @@ try{
     $wb.Worksheets.Item(1).Name='INDEX'
   }
 
-  # ---- ホスト別シート（フロア色分け） ----
+  # ターゲット毎シート（フロア色分け）
   function Ensure-UniqueSheetName($wb,[string]$base){
     $sn=Sanitize-SheetName $base
     $orig=$sn; $i=2
@@ -587,12 +538,10 @@ try{
     }catch{}
 
     $created += $ws.Name
-
-    # 大きなシートを作るたびに軽くGC（メモリ安定化）
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   }
 
-  # ---- INDEX ----
+  # INDEX
   $wsIdx=$wb.Worksheets.Add(); $wsIdx.Name='INDEX'
   $wsIdx.Cells(1,1).Value2='Sheets'
   $r=2
@@ -603,7 +552,6 @@ try{
   }
   foreach($sn in $created){ $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$sn'!A1",'',$sn) | Out-Null; $r++ }
 
-  # 保存
   $wb.SaveAs($Output)
   Write-Host "Output: $Output"
 }
