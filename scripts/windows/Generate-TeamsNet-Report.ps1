@@ -1,21 +1,17 @@
 <#
-Generate-TeamsNet-Report.ps1  (PowerShell 5.1 / Excel COM 解放 / メモリ対策 / COM安全化)
+Generate-TeamsNet-Report.ps1  (PowerShell 5.1 / Excel COM 解放 / メモリ対策 / COM安全化 / 視認性強化)
 
-機能概要:
-- teams_net_quality.csv を集計し、同一Excelブックに:
-  1) LayerSeries: L2/L3/RTR_LAN/RTR_WAN/ZSCALER/SAAS の時間バケット平均
-  2) DeltaSeries: 区間差(Δ) = L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN
-  3) ターゲット毎シート: targets.csv に基づく時系列グラフ（フロア別に色分け、100msの赤破線しきい値付き）
-- SAAS/Zscaler は ICMP 困難 → TCP/HTTP を優先、L2/L3/RTR* は ICMP 優先
-- Excel への大量書き込みは分割チャンク＋軽量モード
-- 2D 配列参照は .GetValue() を使用（[] インデクサに依存しない）
+出力:
+  - LayerSeries: 役割別のRTT（時間バケット平均）
+  - DeltaSeries: 層間のΔ (L3-L2, RTR_LAN-L3, RTR_WAN-RTR_LAN, SAAS-RTR_WAN)
+  - 各ターゲットシート: フロア別に色分けした時系列グラフ（しきい値線、細線＋小マーカー）
 
-使い方(例):
+実行例:
   powershell -NoProfile -ExecutionPolicy Bypass `
     -File .\Generate-TeamsNet-Report.ps1 `
     -CsvPath "$Env:LOCALAPPDATA\TeamsNet\teams_net_quality.csv" `
-    -TargetsCsv "..\targets.csv" `
-    -FloorMap "..\floors.csv" `
+    -TargetsCsv ".\targets.csv" `
+    -FloorMap ".\floors.csv" `
     -Output ".\Output\TeamsNet-Report.xlsx" `
     -BucketMinutes 5 `
     -ThresholdMs 100
@@ -29,7 +25,8 @@ param(
   [int]$BucketMinutes = 5,
   [int]$ThresholdMs = 100,
   [string]$FloorMap,
-  [switch]$Visible
+  [switch]$Visible,
+  [int]$IgnoreTimeoutAtOrAboveMs = 9000  # 9000ms以上はグラフから除外（タイムアウト等）
 )
 
 # ===== 共通設定 =====
@@ -56,12 +53,39 @@ function Set-ExcelPerfMode($app, [bool]$on){
     }
   }catch{}
 }
+# 禁止文字のみ "_" にし、日本語/英数は保持。空や"___"だけになる場合は 'Sheet'。
 function Sanitize-SheetName([string]$name){
-  if(-not $name){ return 'Sheet' }
-  $n = $name -replace '[:\\/\?\*$begin:math:display$$end:math:display$]','_'
-  if($n.Length -gt 31){ $n=$n.Substring(0,31) }
-  if($n -match '^\s*$'){ $n='Sheet' }
-  return $n
+  if([string]::IsNullOrWhiteSpace($name)){ return 'Sheet' }
+  $invalid = @(':','\','/','?','*','[',']')
+  $sb = New-Object System.Text.StringBuilder
+  foreach($ch in $name.ToCharArray()){
+    if([char]::IsControl($ch) -or ($invalid -contains [string]$ch)){
+      [void]$sb.Append('_')
+    } else {
+      [void]$sb.Append($ch)
+    }
+  }
+  $s=$sb.ToString().Trim()
+  if($s.Length -gt 31){ $s=$s.Substring(0,31) }
+  if([string]::IsNullOrWhiteSpace($s) -or $s -match '^_+$'){ $s='Sheet' }
+  return $s
+}
+function Ensure-UniqueSheetName($wb,[string]$base,[string]$fallback){
+  $candidate = Sanitize-SheetName $base
+  if($candidate -eq 'Sheet' -or $candidate -match '^_+$'){
+    $candidate = Sanitize-SheetName $fallback
+  }
+  if([string]::IsNullOrWhiteSpace($candidate)){ $candidate='Sheet' }
+  $orig=$candidate; $i=2
+  while($true){
+    $exists=$false
+    for($ix=1;$ix -le $wb.Worksheets.Count;$ix++){
+      if($wb.Worksheets.Item($ix).Name -eq $candidate){ $exists=$true; break }
+    }
+    if(-not $exists){ break }
+    $candidate = Sanitize-SheetName ("{0}_{1}" -f $orig,$i); $i++
+  }
+  return $candidate
 }
 function Normalize-Host([string]$s){
   if ([string]::IsNullOrWhiteSpace($s)) { return '' }
@@ -92,8 +116,6 @@ function To-DoubleOrNull($v){
 # ===== 分割書き込み（COM/配列/単一値すべて正規化）=====
 function Write-Column2D($ws,[string]$addr,$seq,[int]$ChunkSize=20000){
   if ($null -eq $seq) { return }
-
-  # $seq → List<object> に正規化（COM Range/Variant対応）
   $list = New-Object System.Collections.Generic.List[object]
   if ([System.Runtime.InteropServices.Marshal]::IsComObject($seq)) {
     try {
@@ -101,25 +123,17 @@ function Write-Column2D($ws,[string]$addr,$seq,[int]$ChunkSize=20000){
       if ($null -eq $v) { return }
       if ($v -is [object[,]]) {
         $r0=$v.GetLowerBound(0); $r1=$v.GetUpperBound(0)
-        $c0=$v.GetLowerBound(1)  # 1列目優先
+        $c0=$v.GetLowerBound(1)  # 1列目
         for($r=$r0; $r -le $r1; $r++){ $list.Add($v.GetValue($r,$c0)) }
-      } else {
-        $list.Add($v)
-      }
-    } catch {
-      $list.Add((''+$seq))
-    }
+      } else { $list.Add($v) }
+    } catch { $list.Add((''+$seq)) }
   }
   elseif ($seq -is [System.Collections.IEnumerable] -and -not ($seq -is [string])) {
     foreach($e in $seq){ $list.Add($e) }
   }
   else { $list.Add($seq) }
-
-  $n = $list.Count
-  if ($n -le 0) { return }
-
-  $start = $ws.Range($addr)
-  $idx=0
+  $n = $list.Count; if ($n -le 0) { return }
+  $start = $ws.Range($addr); $idx=0
   while($idx -lt $n){
     $take=[Math]::Min($ChunkSize,$n-$idx)
     $block = New-Object 'object[,]' $take, 1
@@ -163,11 +177,9 @@ function Pick-EffRtt {
     [Parameter(Mandatory=$true)][string]$Role,
     [Parameter(Mandatory=$true)][object]$Row
   )
-  # 列は後段で Resolve-Col 済みの変数名を利用（未存在なら $null）
   $icmp = $null; if ($colIcmp) { $icmp = To-DoubleOrNull $Row.$colIcmp }
   $tcp  = $null; if ($colTcp ) { $tcp  = To-DoubleOrNull $Row.$colTcp  }
   $http = $null; if ($colHttp) { $http = To-DoubleOrNull $Row.$colHttp }
-
   if ($Role -like 'RTR*' -or $Role -eq 'L2' -or $Role -eq 'L3') {
     if ($icmp -ne $null) { return ,@($icmp,'icmp') }
     if ($tcp  -ne $null) { return ,@($tcp ,'tcp')  }
@@ -313,7 +325,10 @@ foreach($row in $data){
     }
     if(-not $matched){ continue }
     $pair = Pick-EffRtt -Role $r -Row $row
-    $val = $pair[0]; if($val -eq $null){ continue }
+    $val = $pair[0]
+    if($val -eq $null){ continue }
+    if($IgnoreTimeoutAtOrAboveMs -gt 0 -and [double]$val -ge $IgnoreTimeoutAtOrAboveMs){ continue }
+
     if(-not (Test-MapHasKey $buckets $bucket)){ $buckets[$bucket]=@{} }
     if(-not (Test-MapHasKey $buckets[$bucket] $r)){ $buckets[$bucket][$r]=New-Object System.Collections.Generic.List[double] }
     $buckets[$bucket][$r].Add([double]$val)
@@ -369,15 +384,14 @@ try{
   # LayerSeries
   if($X.Count -gt 0){
     $ws1=$wb.Worksheets.Item(1); $ws1.Name='LayerSeries'
-    $n=$X.Count
     $ws1.Cells(1,1).Value2='timestamp'
     Write-Column2D $ws1 'A2' $X
-    $ws1.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
+    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End(-4162)).Row
+    try{ $ws1.Range(("A2:A{0}" -f $endRowA)).NumberFormatLocal='mm/dd hh:mm' }catch{}
     $col=2
     foreach($r in $roleOrder){
       $ws1.Cells(1,$col).Value2=$r
-      $vals=$series[$r]
-      Write-Column2D $ws1 ($ws1.Cells(2,$col).Address()) $vals
+      Write-Column2D $ws1 ($ws1.Cells(2,$col).Address()) $series[$r]
       $col++
     }
     $ws1.Columns.AutoFit() | Out-Null
@@ -385,12 +399,15 @@ try{
     $ch1=$ws1.ChartObjects().Add(320,10,900,330); $c1=$ch1.Chart
     $c1.ChartType=$xlXYScatterLines; $c1.HasTitle=$true; $c1.ChartTitle.Text='Layer RTT (bucket avg)'; $c1.Legend.Position=$xlLegendBottom
     try{ $c1.SeriesCollection().Delete() }catch{}
-    $endRow=1+$n; $sCol=2
+    $endRowA = ($ws1.Cells($ws1.Rows.Count,1).End(-4162)).Row
+    $sCol=2
     foreach($r in $roleOrder){
+      $lastValRow = ($ws1.Cells($ws1.Rows.Count,$sCol).End(-4162)).Row
       $s=$c1.SeriesCollection().NewSeries()
       $s.Name=$r
-      $s.XValues=$ws1.Range(("A2:A{0}" -f $endRow))
-      $s.Values =$ws1.Range(($ws1.Cells(2,$sCol).Address()+":"+$ws1.Cells($endRow,$sCol).Address()))
+      $s.XValues=$ws1.Range(("A2:A{0}" -f $endRowA))
+      $s.Values =$ws1.Range(($ws1.Cells(2,$sCol).Address()+":"+$ws1.Cells($lastValRow,$sCol).Address()))
+      try{ $s.Format.Line.Weight=1; $s.MarkerStyle=8; $s.MarkerSize=3 }catch{}
       $sCol++
     }
     try{
@@ -402,25 +419,28 @@ try{
     $ws2=$wb.Worksheets.Add(); $ws2.Name='DeltaSeries'
     $ws2.Cells(1,1).Value2='timestamp'
     Write-Column2D $ws2 'A2' $X
-    $ws2.Range(("A2:A{0}" -f (1+$n))).NumberFormatLocal='mm/dd hh:mm'
+    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End(-4162)).Row
+    try{ $ws2.Range(("A2:A{0}" -f $endRowA2)).NumberFormatLocal='mm/dd hh:mm' }catch{}
     $col=2
     foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
       $ws2.Cells(1,$col).Value2=$d
-      $vals=$delta[$d]
-      Write-Column2D $ws2 ($ws2.Cells(2,$col).Address()) $vals
+      Write-Column2D $ws2 ($ws2.Cells(2,$col).Address()) $delta[$d]
       $col++
     }
     $ws2.Columns.AutoFit() | Out-Null
     $ch2=$ws2.ChartObjects().Add(320,10,900,330); $c2=$ch2.Chart
     $c2.ChartType=$xlXYScatterLines; $c2.HasTitle=$true; $c2.ChartTitle.Text='Layer Δ (bucket avg)'; $c2.Legend.Position=$xlLegendBottom
     try{ $c2.SeriesCollection().Delete() }catch{}
-    $endRow=1+$n; $sCol=2
-    foreach($d in @('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')){
+    $endRowA2 = ($ws2.Cells($ws2.Rows.Count,1).End(-4162)).Row
+    $names=@('DELTA_L3','DELTA_RTR_LAN','DELTA_RTR_WAN','DELTA_CLOUD')
+    for($i=0;$i -lt $names.Count;$i++){
+      $col = 2+$i
+      $lastValRow = ($ws2.Cells($ws2.Rows.Count,$col).End(-4162)).Row
       $s=$c2.SeriesCollection().NewSeries()
-      $s.Name=$d
-      $s.XValues=$ws2.Range(("A2:A{0}" -f $endRow))
-      $s.Values =$ws2.Range(($ws2.Cells(2,$sCol).Address()+":"+$ws2.Cells($endRow,$sCol).Address()))
-      $sCol++
+      $s.Name=$names[$i]
+      $s.XValues=$ws2.Range(("A2:A{0}" -f $endRowA2))
+      $s.Values =$ws2.Range(($ws2.Cells(2,$col).Address()+":"+$ws2.Cells($lastValRow,$col).Address()))
+      try{ $s.Format.Line.Weight=1; $s.MarkerStyle=8; $s.MarkerSize=3 }catch{}
     }
     try{
       $v=$c2.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50
@@ -431,20 +451,6 @@ try{
   }
 
   # ターゲット毎シート（フロア色分け）
-  function Ensure-UniqueSheetName($wb,[string]$base){
-    $sn=Sanitize-SheetName $base
-    $orig=$sn; $i=2
-    while($true){
-      $exists=$false
-      for($ix=1;$ix -le $wb.Worksheets.Count;$ix++){
-        if($wb.Worksheets.Item($ix).Name -eq $sn){ $exists=$true; break }
-      }
-      if(-not $exists){ break }
-      $sn=Sanitize-SheetName ($orig+"_"+$i); $i++
-    }
-    return $sn
-  }
-
   $created=@()
   foreach($t in $targets){
     # 該当行抽出
@@ -452,7 +458,9 @@ try{
     foreach($row in $data){
       $hraw=''+$row.$colHost; if(-not $hraw){ continue }
       $hnorm=Normalize-Host $hraw
-      if($hnorm -eq $t.KeyNorm -or $hnorm.Contains($t.KeyNorm) -or $t.KeyNorm.Contains($hnorm)){ $rows+=,$row }
+      if($hnorm -eq $t.KeyNorm -or $hnorm.Contains($t.KeyNorm) -or $t.KeyNorm.Contains($hnorm)){
+        $rows+=,$row
+      }
     }
     if($rows.Count -eq 0){ continue }
 
@@ -465,11 +473,13 @@ try{
 
       $pair=Pick-EffRtt -Role $t.Role -Row $row
       $y=$pair[0]; if($y -eq $null){ continue }
+      if($IgnoreTimeoutAtOrAboveMs -gt 0 -and [double]$y -ge $IgnoreTimeoutAtOrAboveMs){ continue }
 
       $apName = ''; if ($colAp)    { $apName = ''+$row.$colAp }
       $bssid  = ''; if ($colBssid) { $bssid  = ''+$row.$colBssid }
       $ssidv  = ''; if ($colSsid)  { $ssidv  = ''+$row.$colSsid }
       $floor  = Guess-Floor $apName $bssid $ssidv
+      if([string]::IsNullOrWhiteSpace($floor)){ $floor='Unknown' }
 
       if(-not (Test-MapHasKey $byFloor $floor)){
         $byFloor[$floor]=@{ times=New-Object System.Collections.Generic.List[double]; vals=New-Object System.Collections.Generic.List[double] }
@@ -480,14 +490,14 @@ try{
     if($byFloor.Keys.Count -eq 0){ continue }
 
     $ws=$wb.Worksheets.Add()
-    $ws.Name = Ensure-UniqueSheetName $wb $t.Label
+    $ws.Name = Ensure-UniqueSheetName $wb $t.Label ("{0}_{1}" -f $t.Role,$t.Key)
 
     # 各フロア列（time_X, rtt_X）
     $col=1
     $floorList=@($byFloor.Keys) | Sort-Object
     $unionTimes = New-Object System.Collections.Generic.List[double]
     foreach($fl in $floorList){
-      # ペア化して時刻で整列（X/Y同期）
+      # X/Y同期化（時刻ソート）
       $pairs=@()
       for($i=0;$i -lt $byFloor[$fl].times.Count;$i++){
         $pairs += [pscustomobject]@{ t=[double]$byFloor[$fl].times[$i]; r=[double]$byFloor[$fl].vals[$i] }
@@ -527,11 +537,12 @@ try{
     foreach($fl in $floorList){
       $s=$c.SeriesCollection().NewSeries()
       $s.Name=("RTT ({0})" -f $fl)
-      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row  # xlUp=-4162
+      $endRowTime = ($ws.Cells($ws.Rows.Count,$colIdx).End(-4162)).Row
       $endRowVal  = ($ws.Cells($ws.Rows.Count,$colIdx+1).End(-4162)).Row
       $endRow = [Math]::Max($endRowTime,$endRowVal)
       $s.XValues=$ws.Range(($ws.Cells(2,$colIdx).Address()+":"+$ws.Cells($endRow,$colIdx).Address()))
       $s.Values =$ws.Range(($ws.Cells(2,$colIdx+1).Address()+":"+$ws.Cells($endRow,$colIdx+1).Address()))
+      try{ $s.Format.Line.Weight=1; $s.MarkerStyle=8; $s.MarkerSize=3 }catch{}
       $colIdx+=2
     }
     # 閾値
@@ -540,7 +551,7 @@ try{
     $endRow = ($ws.Cells($ws.Rows.Count,$col).End(-4162)).Row
     $s2.XValues=$ws.Range(($ws.Cells(2,$col).Address()+":"+$ws.Cells($endRow,$col).Address()))
     $s2.Values =$ws.Range(($ws.Cells(2,$col+1).Address()+":"+$ws.Cells($endRow,$col+1).Address()))
-    try{ $s2.Format.Line.ForeColor.RGB=255; $s2.Format.Line.Weight=1.5; $s2.Format.Line.DashStyle=$msoLineDash }catch{}
+    try{ $s2.Format.Line.ForeColor.RGB=255; $s2.Format.Line.Weight=1; $s2.Format.Line.DashStyle=$msoLineDash }catch{}
 
     try{
       $v=$c.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50
