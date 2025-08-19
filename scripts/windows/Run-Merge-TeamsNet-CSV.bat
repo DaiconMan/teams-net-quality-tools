@@ -4,23 +4,24 @@ setlocal EnableExtensions
 rem ===== 設定 =====
 set "SCRIPT=Merge-TeamsNet-CSV.ps1"
 
-rem ; 区切りで複数フォルダを指定（スペース可、各要素はダブルクォート有無どちらでも可）
-rem 例）set "FOLDERS=C:\Users\me\OneDrive - Company\Teams Logs\8F-A;""C:\Users\me\OneDrive - Company\Teams Logs\10F-B"""
-set "FOLDERS=C:\Users\me\OneDrive - Company\Teams Logs\8F-A;C:\Users\me\OneDrive - Company\Teams Logs\10F-B"
+rem ; 区切りでフォルダを列挙（相対パスOK、内側に追加の " は不要）
+rem 例: set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
+rem 例: set "FOLDERS=C:\Users\me\OneDrive - Company\Teams Logs\8F-A;C:\Users\me\OneDrive - Company\Teams Logs\10F-B"
+set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
 
-rem 各フォルダのタグ。空なら「フォルダ名（末端名）」を自動タグ化
+rem 各フォルダのタグ。空なら末端フォルダ名を自動採用（8F-A など）
 set "TAGS="
 
-rem 1=サブフォルダも再帰、0=直下のみ
+rem 1=サブフォルダ再帰 / 0=直下のみ
 set "RECURSE=1"
 
-rem 収集パターン
+rem 収集するファイルパターン
 set "PATTERN=*.csv"
 
 rem 出力先（相対ならこのbatの場所基準）
 set "OUTPUT=merged_all.csv"
 
-rem Excel向けにBOM付きUTF-8で書き出すなら1
+rem Excel互換でBOM付きUTF-8にするなら 1
 set "UTF8BOM=1"
 rem =================
 
@@ -52,12 +53,10 @@ echo --- 収集とマージを開始 ---
   "$mergeScript=[IO.Path]::GetFullPath('%ABS_SCRIPT%');" ^
   "$out=[IO.Path]::GetFullPath('%ABS_OUT%');" ^
   "if(-not (Test-Path -LiteralPath $mergeScript)){ throw 'PS1 not found: ' + $mergeScript }" ^
-  "Write-Host ('* using script: {0}' -f $mergeScript);" ^
-  "Get-Command -Name $mergeScript -Syntax | Out-Host;" ^
   "$raw = $env:FOLDERS -split ';';" ^
-  "$folders = foreach($x in $raw){ $t=$x.Trim(); if($t){ $t=$t.Trim('\"'); if(Test-Path -LiteralPath $t){ $t } else { Write-Warning ('Skip (not found): {0}' -f $x) } } };" ^
+  "$folders = foreach($x in $raw){ $t=$x.Trim(); if($t){ if(Test-Path -LiteralPath $t){ (Resolve-Path -LiteralPath $t).Path } else { Write-Warning ('Skip (not found): {0}' -f $x) } } };" ^
   "if(-not $folders -or $folders.Count -eq 0){ throw 'FOLDERS で指定されたフォルダが見つかりません。' }" ^
-  "$tags = if([string]::IsNullOrWhiteSpace($env:TAGS)){ $folders | ForEach-Object { Split-Path $_ -Leaf } } else { ($env:TAGS -split ';' | ForEach-Object { $_.Trim().Trim('\"') }) };" ^
+  "$tags = if([string]::IsNullOrWhiteSpace($env:TAGS)){ $folders | ForEach-Object { Split-Path $_ -Leaf } } else { ($env:TAGS -split ';' | ForEach-Object { $_.Trim() }) };" ^
   "if($folders.Count -ne $tags.Count){ throw 'FOLDERS と TAGS の数が一致しません。TAGS を空にするとフォルダ名が自動タグになります。' }" ^
   "$all    = New-Object 'System.Collections.Generic.List[string]';" ^
   "$tagsEx = New-Object 'System.Collections.Generic.List[string]';" ^
@@ -70,11 +69,10 @@ echo --- 収集とマージを開始 ---
   "if($all.Count -eq 0){ throw '指定フォルダ群に CSV が見つかりません。' }" ^
   "$inputs = [string]::Join(';', @($all));" ^
   "$tagsStr= [string]::Join(';', @($tagsEx));" ^
-  "Write-Host ('* 収集ファイル数: {0} / タグ数: {1}' -f $all.Count, $tagsEx.Count);" ^
-  "$params = @{ InputCsvs = $inputs; Tags = $tagsStr; Output = $out };" ^
+  "$params = @{ InputCsvs = $inputs; Tags = $tagsStr; Output = [IO.Path]::GetFullPath('%ABS_OUT%') };" ^
   "if('%UTF8BOM%' -eq '1'){ $params['Utf8Bom'] = $true }" ^
   "& (Get-Item -LiteralPath $mergeScript).FullName @params" ^
-  "; if($?) { Write-Host ('* 出力: {0}' -f $out); exit 0 } else { exit 1 }"
+  "; if($?) { Write-Host ('* 出力: {0}' -f $params.Output); exit 0 } else { exit 1 }"
 
 set "RC=%ERRORLEVEL%"
 echo * 終了コード: %RC%
