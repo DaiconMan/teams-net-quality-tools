@@ -7,8 +7,7 @@ set "SCRIPT=Merge-TeamsNet-CSV.ps1"
 rem 1つ以上のフォルダを ; で区切って指定（例：8F-A と 10F-B）
 set "FOLDERS=C:\Logs\8F-A;C:\Logs\10F-B"
 
-rem 各フォルダに対応するタグ。空なら「フォルダ名」を自動タグ化
-rem 例）"8F-A;10F-B"   または空欄: ""
+rem 各フォルダのタグ。空なら「フォルダ名」を自動タグ化（例：8F-A / 10F-B）
 set "TAGS="
 
 rem 再帰的に集めるなら 1、直下のみなら 0
@@ -29,11 +28,9 @@ chcp 932 >nul 2>&1
 set "BASE=%~dp0"
 pushd "%BASE%" >nul 2>&1
 
-rem PowerShell 実体
 set "PS=pwsh.exe"
 where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
 
-rem 絶対パス解決
 for %%I in ("%SCRIPT%")  do set "ABS_SCRIPT=%%~fI"
 for %%I in ("%OUTPUT%")  do set "ABS_OUT=%%~fI"
 
@@ -45,6 +42,9 @@ if not defined FOLDERS (
   echo [ERROR] FOLDERS が未設定です。; 区切りでフォルダを指定してください。
   goto :fail
 )
+
+set "BOMSW="
+if "%UTF8BOM%"=="1" set "BOMSW=-Utf8Bom"
 
 echo --- 収集とマージを開始 ---
 "%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^

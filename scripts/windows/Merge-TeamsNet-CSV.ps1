@@ -1,16 +1,15 @@
 # Merge-TeamsNet-CSV.ps1  --  名前付き引数専用: -InputCsvs / -Tags / -Output [/ -Utf8Bom]
 [CmdletBinding()]
 param(
-  # 位置指定で渡されたら明示エラーにするブロッカー
+  # 位置指定で渡されたら明示エラー
   [Parameter(Position=0)][AllowNull()][string]$__arg0,
   [Parameter(Position=1)][AllowNull()][string]$__arg1,
 
-  # ← 必ず名前付きで指定
+  # ← 必ず「名前付き」で指定（文字列/配列/「;」区切り いずれも可）
   [Parameter(Mandatory=$true)]
-  [object]$InputCsvs,   # 文字列/配列/「;」区切り いずれもOK（下で正規化）
-
+  [object]$InputCsvs,
   [Parameter(Mandatory=$true)]
-  [object]$Tags,        # 同上（件数は InputCsvs と一致必須）
+  [object]$Tags,
 
   [Parameter()]
   [string]$Output = ".\merged_teams_net_quality.csv",
@@ -74,17 +73,14 @@ for($i=0;$i -lt $files.Count;$i++){
     continue
   }
 
-  $hdr=@{}
   foreach($n in $rows[0].PSObject.Properties.Name){
     $null = $all.Add($n)
-    $hdr[$n.ToLowerInvariant()] = $n
   }
 
   $datasets += [pscustomobject]@{
-    Path   = $path
-    Tag    = $tag
-    Rows   = $rows
-    Header = $hdr
+    Path = $path
+    Tag  = $tag
+    Rows = $rows
   }
 }
 
