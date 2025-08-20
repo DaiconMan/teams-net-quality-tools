@@ -1,21 +1,30 @@
 # Merge-TeamsNet-CSV.ps1
-# 目的: 各入力フォルダ内の path_hop_quality.csv（等、指定CSV）を**加工せず**マージする。
-# 注意: カラムは現状維持（dest_ip を含む）。入力に無ければ空欄で出力。
-# PS 5.1 対応（?: 不使用）、$Host 変数は未使用。OneDrive/日本語パス対応。
+# 目的:
+#   - 入力で受け取った「パス」は“ファイル or ディレクトリ”のどちらでも可
+#   - ディレクトリが渡された場合は、その配下の *.csv（既定は非再帰）を収集してマージ
+#   - 値の加工は行わない（単純マージ）。列構成は現状維持（dest_ip を含み、無い場合は空欄）
+#   - SplitByDate 機能は従来通りサポート
+# 注意:
+#   - PowerShell 5.1 対応（?: 不使用）、$Host 予約語は未使用
+#   - OneDrive / 日本語 / スペースを含むパスに配慮（-LiteralPath / Resolve-Path）
+#   - Cドライブ非表示環境を想定（相対/OneDriveパスで動作）
 
 [CmdletBinding()]
 param(
-  # ; 区切り or 配列 で CSV ファイルパス（例: .\A\path_hop_quality.csv;.\B\path_hop_quality.csv）
+  # ; 区切り or 配列で、CSVファイル or ディレクトリを列挙
   [Parameter(Mandatory=$true)][object]$InputCsvs,
-  # 各CSVに対応するタグ（; 区切り or 配列）。空なら親フォルダ名を自動採用
+  # 入力単位（InputCsvs の各要素）に対応するタグ。空なら自動（末端フォルダ名）
   [Parameter(Mandatory=$true)][object]$Tags,
 
-  # 1本出力 or 日別分割
+  # 単一ファイル出力 or 日別分割
   [Parameter()][string]$Output = ".\merged_teams_net_quality.csv",
   [Parameter()][switch]$SplitByDate,
   [Parameter()][string]$DateColumn = "timestamp",
   [Parameter()][string]$DateFormat = "yyyyMMdd",
-  [Parameter()][string]$OutputDir
+  [Parameter()][string]$OutputDir,
+
+  # ディレクトリ指定時に再帰的に *.csv を拾うか
+  [Parameter()][switch]$Recurse
 )
 
 # -------- helpers --------
@@ -30,83 +39,141 @@ function To-StringArray([object]$v){
 
 function Get-DayKey([object]$v, [string]$fmt="yyyyMMdd"){
   $s = if($v -ne $null){ [string]$v } else { "" }
-  if($s -match '^\s*(\d{4})[/-](\d{2})[/-](\d{2})'){
-    return ('{0}{1}{2}' -f $Matches[1],$Matches[2],$Matches[3])
-  }
+  if($s -match '^\s*(\d{4})[/-](\d{2})[/-](\d{2})'){ return ('{0}{1}{2}' -f $Matches[1],$Matches[2],$Matches[3]) }
   try { return ([datetime]$s).ToString($fmt) } catch { return "Unknown" }
 }
 
-# -------- main --------
-$files = To-StringArray $InputCsvs
-$tags  = To-StringArray $Tags
-
-# 検証 & 正規化（フルパス化）
-$resolved = New-Object System.Collections.Generic.List[string]
-foreach($p in $files){
-  if(-not (Test-Path -LiteralPath $p)){ throw "CSV not found: $p" }
-  $rp = (Resolve-Path -LiteralPath $p).Path
-  [void]$resolved.Add($rp)
+# 拡張子 ".cs　v" のような誤記を ".csv" に矯正（末尾のみ）
+function Fix-CsvExtension([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){ return $p }
+  # 全角/半角スペースを含む ".cs   v" / ".cs　　v" を ".csv" に置換
+  $p2 = [regex]::Replace($p, '\.cs[\u3000\s]+v$', '.csv')
+  return $p2
 }
-$files = @($resolved)
 
-# タグ補完（空なら末端フォルダ名）
-if($tags.Count -eq 0){
-  $tags = @()
-  foreach($f in $files){
-    $dir = Split-Path -Parent $f
-    $tags += (Split-Path -Leaf $dir)
+# 入力単位（ファイル or ディレクトリ）を解析し、実ファイル一覧と単位タグの対応を展開
+function Expand-InputUnits([string[]]$units, [string[]]$unitTags, [switch]$recurse){
+  $out = New-Object System.Collections.Generic.List[object]
+  for($i=0;$i -lt $units.Count;$i++){
+    $raw = $units[$i]
+    # 末尾の ".cs [spaces] v" を補正
+    $maybe = Fix-CsvExtension -p $raw
+
+    # 前後空白は削除（全角/半角）
+    $trimmed = $maybe.Trim((" `t`r`n") + ([char]0x3000))
+    $path = $trimmed
+    $tag  = $unitTags[$i]
+
+    # ファイル/ディレクトリの存在判定（存在しない場合は、そのまま警告）
+    $isFile = $false; $isDir = $false
+    if(Test-Path -LiteralPath $path){
+      $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+      if($item -ne $null){
+        if($item.PSIsContainer){ $isDir = $true } else { $isFile = $true }
+      }
+    }
+
+    if($isFile){
+      $rp = (Resolve-Path -LiteralPath $path).Path
+      $out.Add([pscustomobject]@{ File=$rp; Tag=$tag }) | Out-Null
+    } elseif($isDir){
+      $opt = @{}
+      $opt['LiteralPath'] = $path
+      $opt['File'] = $true
+      $opt['Filter'] = '*.csv'
+      if($recurse){ $opt['Recurse'] = $true }
+      $files = Get-ChildItem @opt | Select-Object -ExpandProperty FullName
+      if(-not $files -or $files.Count -eq 0){
+        Write-Warning ("CSV not found in directory: {0}" -f $path)
+      } else {
+        foreach($f in $files){
+          $out.Add([pscustomobject]@{ File=$f; Tag=$tag }) | Out-Null
+        }
+      }
+    } else {
+      Write-Warning ("Input path not found (skipped): {0}" -f $path)
+    }
   }
-}
-if($files.Count -ne $tags.Count){
-  throw "Files($($files.Count)) と Tags($($tags.Count)) の数が一致しません。-InputCsvs と -Tags を見直してください。"
+  return ,$out
 }
 
-# ヘッダー和集合（大小無視）。現状維持カラムを**強制**含める。
-$cmp = [System.StringComparer]::OrdinalIgnoreCase
-$headerSet = New-Object System.Collections.Generic.HashSet[string] $cmp
+# -------- main --------
+$units = To-StringArray $InputCsvs
+$unitTags = To-StringArray $Tags
 
-# 現状維持のために必ず残す列（dest_ip とメタ列）
-$forceColumns = @('dest_ip') # ※ 入力に無い場合は空で出力（列構成維持）
-$metaColumns  = @('probe','tz_offset','source_file') # 既存どおり末尾に付与
-
-foreach($f in $files){
-  try   { $rows = Import-Csv -Path $f -Encoding UTF8 }
-  catch { $rows = Import-Csv -Path $f -Encoding Default }
-  if(-not $rows -or $rows.Count -eq 0){ continue }
-  foreach($n in $rows[0].PSObject.Properties.Name){ [void]$headerSet.Add($n) }
-}
-foreach($fc in $forceColumns){ [void]$headerSet.Add($fc) }
-
-# 最終ヘッダー（入力順に近い安定化：最初のCSVの順 → 和集合残り → 強制列 → メタ列）
-$ordered = @()
-if($files.Count -gt 0){
-  try   { $firstRows = Import-Csv -Path $files[0] -Encoding UTF8 }
-  catch { $firstRows = Import-Csv -Path $files[0] -Encoding Default }
-  if($firstRows -and $firstRows.Count -gt 0){
-    foreach($n in $firstRows[0].PSObject.Properties.Name){
-      if($headerSet.Contains($n) -and -not $ordered.Contains($n)){ $ordered += $n }
+# タグ補完（空なら入力単位の末端フォルダ名）
+if($unitTags.Count -eq 0){
+  $unitTags = @()
+  foreach($u in $units){
+    $p = $u
+    $p = Fix-CsvExtension -p $p
+    $p = $p.Trim((" `t`r`n") + ([char]0x3000))
+    if(Test-Path -LiteralPath $p){
+      $gi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
+      if($gi -and -not $gi.PSIsContainer){
+        $base = Split-Path -Parent $gi.FullName
+        $unitTags += (Split-Path -Leaf $base)
+      } else {
+        $unitTags += (Split-Path -Leaf $p)
+      }
+    } else {
+      # 見つからない場合は文字列から推定
+      $unitTags += (Split-Path -Leaf $p)
     }
   }
 }
-# 和集合の残り
-foreach($h in $headerSet){
-  if(-not ($ordered -contains $h)){ $ordered += $h }
+if($units.Count -ne $unitTags.Count){
+  throw "InputCsvs の要素数($($units.Count)) と Tags の要素数($($unitTags.Count)) が一致しません。"
 }
 
-# メタ列は最後
+# 単位を展開（ディレクトリ→*.csv 群）
+$entries = Expand-InputUnits -units $units -unitTags $unitTags -recurse:$Recurse
+if($entries.Count -eq 0){ throw "有効な CSV が見つかりませんでした。" }
+
+# 列集合を構築（大小無視、現状維持：dest_ip を強制含有、メタ列は末尾）
+$cmp = [System.StringComparer]::OrdinalIgnoreCase
+$headerSet = New-Object System.Collections.Generic.HashSet[string] $cmp
+$forceColumns = @('dest_ip')                   # 列は残す。無ければ空欄で出力
+$metaColumns  = @('probe','tz_offset','source_file')
+
+# 最初のファイルの列順を優先して安定化
+$firstFile = $entries[0].File
+try   { $firstRows = Import-Csv -Path $firstFile -Encoding UTF8 }
+catch { $firstRows = Import-Csv -Path $firstFile -Encoding Default }
+if($firstRows -and $firstRows.Count -gt 0){
+  foreach($n in $firstRows[0].PSObject.Properties.Name){ [void]$headerSet.Add($n) }
+}
+
+# 全ファイルからヘッダ和集合
+foreach($e in $entries){
+  try   { $rows = Import-Csv -Path $e.File -Encoding UTF8; }
+  catch { $rows = Import-Csv -Path $e.File -Encoding Default; }
+  if($rows -and $rows.Count -gt 0){
+    foreach($n in $rows[0].PSObject.Properties.Name){ [void]$headerSet.Add($n) }
+  }
+}
+foreach($fc in $forceColumns){ [void]$headerSet.Add($fc) }
+
+# 最終ヘッダ順を決定
+$ordered = @()
+if($firstRows -and $firstRows.Count -gt 0){
+  foreach($n in $firstRows[0].PSObject.Properties.Name){
+    if($headerSet.Contains($n) -and -not $ordered.Contains($n)){ $ordered += $n }
+  }
+}
+foreach($h in $headerSet){ if(-not ($ordered -contains $h)){ $ordered += $h } }
 $allHeaders = @($ordered + $metaColumns)
 
-# 出力準備
+# 本体マージ
 $outList = New-Object System.Collections.Generic.List[object]
 $tz = ([datetimeoffset](Get-Date)).ToString("zzz")
 
-for($i=0; $i -lt $files.Count; $i++){
-  $path = $files[$i]; $tag = $tags[$i]
-  try   { $rows = Import-Csv -Path $path -Encoding UTF8 }
-  catch { $rows = Import-Csv -Path $path -Encoding Default }
+foreach($e in $entries){
+  try   { $rows = Import-Csv -Path $e.File -Encoding UTF8 }
+  catch { $rows = Import-Csv -Path $e.File -Encoding Default }
 
   if(-not $rows -or $rows.Count -eq 0){
-    Write-Warning "Empty CSV skipped: $path"
+    Write-Warning ("Empty CSV skipped: {0}" -f $e.File)
     continue
   }
 
@@ -116,22 +183,21 @@ for($i=0; $i -lt $files.Count; $i++){
       if($r.PSObject.Properties.Name -contains $h){
         $row[$h] = $r.$h
       } else {
-        # 大文字小文字違いを吸収
         $k = $r.PSObject.Properties.Name | Where-Object { $_ -ieq $h } | Select-Object -First 1
         if($k){ $row[$h] = $r.$k } else { $row[$h] = $null }
       }
     }
-    # 現状どおりメタ列を最後に付与（machine/user は出力しない仕様）
-    $row['probe']       = $tag
+    $row['probe']       = $e.Tag
     $row['tz_offset']   = $tz
-    $row['source_file'] = $path
+    $row['source_file'] = $e.File
 
     [void]$outList.Add([pscustomobject]$row)
   }
 }
 
-if($outList.Count -eq 0){ throw "有効な入力CSVがありませんでした。" }
+if($outList.Count -eq 0){ throw "有効な行がありませんでした。" }
 
+# 出力
 if($SplitByDate){
   $baseDir = $OutputDir
   if([string]::IsNullOrWhiteSpace($baseDir)){
@@ -140,13 +206,10 @@ if($SplitByDate){
   }
   if(-not (Test-Path -LiteralPath $baseDir)){ New-Item -ItemType Directory -Path $baseDir | Out-Null }
 
-  # ヘッダーは Export-Csv に任せる（追記）
   foreach($o in $outList){
     $day = "Unknown"
     $dc = $DateColumn
-    if($o.PSObject.Properties.Name -contains $dc){
-      $day = Get-DayKey $o.$dc $DateFormat
-    }
+    if($o.PSObject.Properties.Name -contains $dc){ $day = Get-DayKey $o.$dc $DateFormat }
     $file = Join-Path $baseDir ("merged_{0}.csv" -f $day)
     $exists = Test-Path -LiteralPath $file
     $o | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8 -Append:($exists) -Force
