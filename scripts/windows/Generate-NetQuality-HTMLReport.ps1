@@ -1,11 +1,11 @@
 <#
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
   - 入力: teams_net_quality.csv（Measure-NetQuality-WithHops.ps1 の品質CSV）
-  - 補正: floor.csv (BSSID→エリア/階/tag), node_roles.csv (IP/FQDN→役割/ラベル/セグメント)
-  - 出力: HTML 単一ファイル（外部ライブラリ不要）
+  - 補正: floor.csv (BSSID→area/floor/tag), node_roles.csv (IP/FQDN→role/label/segment)
+  - 出力: HTML 単一ファイル（外部ライブラリ不要、UTF-8 BOM）
   - 仕様: path_hop_quality.csv は解析しない（ZscalerによりInternet/SaaS向けpingは信頼しない想定）
   - 既定で SaaS / Internet は一覧から除外（HTML内のトグルで含め可能）
-  - エンコード: UTF-8 (BOM付き) で出力し文字化け防止
+  - OneDrive/日本語・スペースパス対応（出力先ディレクトリ自動作成）
   - 注意: PowerShellの $Host は未使用。CSVの列名 host は target として扱う。
 
   使い方例:
@@ -243,10 +243,10 @@ foreach($g in $groups){
   }
 }
 
-# ===== HTML 生成 =====
+# ===== HTML テンプレ生成（単一引用ヒアストリング; 変数展開しない）=====
 $summaryJson = $summaryRows | ConvertTo-Json -Depth 5
 
-$html = @"
+$htmlTemplate = @'
 <!doctype html>
 <html lang="ja">
 <head>
@@ -317,7 +317,7 @@ $html = @"
 
 <script>
   // ====== データ埋め込み ======
-  var summaryRows = $summaryJson;
+  var summaryRows = __SUMMARY_JSON__;
 
   // ====== UI初期化 ======
   function uniq(vals){
@@ -439,21 +439,29 @@ $html = @"
 </script>
 </body>
 </html>
-"@
+'@
 
-# 出力 (UTF-8 BOM)
+# プレースホルダ置換で JSON を安全に埋め込み
+# （ConvertTo-Json は UTF-16 ではなく .NET 文字列、後段で UTF-8 BOM にて出力）
+$html = $htmlTemplate.Replace('__SUMMARY_JSON__', $summaryJson)
+
+# ===== 出力 (UTF-8 BOM) ─ OneDrive/日本語パス対応 =====
 try {
+  $fullPath = [System.IO.Path]::GetFullPath($OutHtml)
+  $dir = [System.IO.Path]::GetDirectoryName($fullPath)
+  if (-not [string]::IsNullOrWhiteSpace($dir)) {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  }
   $enc = New-Object System.Text.UTF8Encoding($true) # BOM付き
-  $path = (Resolve-Path $OutHtml).Path
-  [System.IO.File]::WriteAllText($path, $html, $enc)
-  Write-Output "HTMLレポートを出力しました(UTF-8 BOM): $OutHtml"
+  [System.IO.File]::WriteAllText($fullPath, $html, $enc)
+  Write-Output ("HTMLレポートを出力しました(UTF-8 BOM): {0}" -f $fullPath)
 } catch {
   # フォールバック
   $html | Out-File -FilePath $OutHtml -Encoding utf8
-  Write-Warning "WriteAllText 失敗のため Out-File で出力しました。"
+  Write-Warning "WriteAllText に失敗したため Out-File で出力しました。"
 }
 
-# 参考: マッピング状況の簡易サマリ（具体データは表示しません）
+# 参考: マッピング率（数値のみ表示。実データは表示しません）
 $total = $qual.Count
 $mapped = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
 if ($total -gt 0) {
