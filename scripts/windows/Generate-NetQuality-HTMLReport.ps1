@@ -1,19 +1,13 @@
 <#
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
-  - 入力: teams_net_quality.csv（Measure-NetQuality-WithHops.ps1 の品質CSV）
+  - 入力: teams_net_quality.csv
   - 補正: floor.csv (BSSID/SSID → area/floor/tag), node_roles.csv (IP/FQDN → role/label/segment)
-  - 出力: HTML 単一ファイル（外部ライブラリ不要、UTF-8 BOM）
-  - 仕様: path_hop_quality.csv は解析しない（ZscalerによりInternet/SaaS向けpingは信頼しない想定）
-  - 既定で SaaS / Internet は一覧から除外（HTML内のトグルで含め可能）
-  - 列名の自動検出（別名/大小文字差分に対応）、SSIDでのエリア補完（*ワイルドカード可）
-  - OneDrive/日本語・スペースパス対応（出力先ディレクトリ自動作成）
+  - 出力: HTML 単一ファイル（UTF-8 BOM）
+  - 仕様: path_hop_quality.csv は不使用（Zscaler配慮）
+  - 既定で SaaS/Internet を除外（UIトグルで含め可能）
+  - 列名：BOM/空白/大小文字/別名を自動吸収
+  - OneDrive/日本語パス対応（出力先ディレクトリ自動作成）
   - 注意: PowerShellの $Host は未使用。CSVの列名 host は target として扱う。
-
-  使い方例:
-    powershell -ExecutionPolicy Bypass -File .\Generate-NetQuality-HTMLReport.ps1 `
-      -QualityCsv ".\teams_net_quality.csv" `
-      -BssidFloorCsv ".\floor.csv" -NodeRoleCsv ".\node_roles.csv" `
-      -OutHtml ".\NetQuality-Report.html"
 #>
 
 [CmdletBinding()]
@@ -80,7 +74,27 @@ function Normalize-Ssid {
   return ($s.Trim().ToLower())
 }
 
-# floor.csv の bssid/ssid が接頭辞（末尾 *）かを判定して正規化して返す
+# 列名のBOM/空白/大小文字揺れを吸収
+function Normalize-HeaderName {
+  param([string]$name)
+  if ($null -eq $name) { return "" }
+  $n = $name.Replace([string]([char]0xFEFF), '') # BOM除去
+  $n = $n.Trim().ToLower()
+  return $n
+}
+
+# Import-Csv の安全版（UTF8優先、失敗時デフォルト）
+function Import-CsvSafe {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return @() }
+  try {
+    return Import-Csv -Path $Path -Encoding UTF8
+  } catch {
+    return Import-Csv -Path $Path
+  }
+}
+
+# floor の bssid/ssid が接頭辞（末尾 *）かを判定して正規化
 function Get-MapKey {
   param([string]$raw, [switch]$IsSsid)
   if ([string]::IsNullOrWhiteSpace($raw)) {
@@ -98,30 +112,53 @@ function Get-MapKey {
 
 # ===== CSV 読み込み =====
 if (-not (Test-Path -LiteralPath $QualityCsv)) { Write-Error "QualityCsv が見つかりません: $QualityCsv"; exit 1 }
-$qualRaw = Import-Csv -Path $QualityCsv
-
+$qualRaw  = Import-CsvSafe -Path $QualityCsv
 $floorMap = @()
-if (Test-Path -LiteralPath $BssidFloorCsv) { $floorMap = Import-Csv -Path $BssidFloorCsv }
-
+if (Test-Path -LiteralPath $BssidFloorCsv) { $floorMap = Import-CsvSafe -Path $BssidFloorCsv }
 $nodeRoles = @()
-if (Test-Path -LiteralPath $NodeRoleCsv) { $nodeRoles = Import-Csv -Path $NodeRoleCsv }
+if (Test-Path -LiteralPath $NodeRoleCsv)   { $nodeRoles = Import-CsvSafe -Path $NodeRoleCsv }
 
-# ===== 列名の自動検出 =====
+# ===== 列名の自動検出（強化）=====
 function Find-Col {
   param(
     [object]$row,
     [string[]]$candidates
   )
-  $props = @($row.PSObject.Properties.Name)
+  $rawProps = @($row.PSObject.Properties.Name)
+  $props = @()
+  foreach($p in $rawProps){
+    $props += (Normalize-HeaderName $p)
+  }
+
+  # 1) 完全一致
   foreach($cand in $candidates){
-    foreach($p in $props){
-      if ($p -and $cand -and ($p.ToString().Trim().ToLower() -eq $cand.ToLower())) { return $p }
+    $c = Normalize-HeaderName $cand
+    for($i=0; $i -lt $props.Count; $i++){
+      if ($props[$i] -eq $c) { return $rawProps[$i] }
     }
   }
-  # 前方一致（例: icmp_avg_ms vs avg_ms）も最後に試す
+
+  # 2) 単語境界一致（^cand$ | ^cand[_\-] | [_\-]cand[_\-] | [_\-]cand$）
   foreach($cand in $candidates){
-    foreach($p in $props){
-      if ($p -and $cand -and ($p.ToString().Trim().ToLower()).Contains($cand.ToLower())) { return $p }
+    $c = Normalize-HeaderName $cand
+    for($i=0; $i -lt $props.Count; $i++){
+      $pn = $props[$i]
+      $hit = $false
+      if ($pn -eq $c) { $hit = $true }
+      else {
+        if ($pn.StartsWith($c + "_") -or $pn.StartsWith($c + "-")) { $hit = $true }
+        elseif ($pn.EndsWith("_" + $c) -or $pn.EndsWith("-" + $c)) { $hit = $true }
+        elseif ($pn.Contains("_" + $c + "_") -or $pn.Contains("-" + $c + "-")) { $hit = $true }
+      }
+      if ($hit) { return $rawProps[$i] }
+    }
+  }
+
+  # 3) 部分一致（最後の手段）
+  foreach($cand in $candidates){
+    $c = Normalize-HeaderName $cand
+    for($i=0; $i -lt $props.Count; $i++){
+      if ($props[$i].Contains($c)) { return $rawProps[$i] }
     }
   }
   return $null
@@ -132,7 +169,10 @@ function Get-Val {
   if ([string]::IsNullOrWhiteSpace($colName)) { return $null }
   $val = $row.$colName
   if ($null -eq $val) { return $null }
-  $txt = $val.ToString().Trim()
+  $txt = $val.ToString()
+  # 先頭BOM等を除去
+  $txt = $txt.Replace([string]([char]0xFEFF), '')
+  $txt = $txt.Trim()
   if ($txt -eq "") { return $null }
   return $txt
 }
@@ -167,13 +207,27 @@ $tagBySsidExact   = @{}
 $prefixSsid = @()  # @{ Prefix="corp-wifi"; Area="X"; Floor="Y"; Tag="Z" }
 
 foreach($r in $floorMap){
-  $area = $r.area
-  $floor= $null; if ($r.PSObject.Properties.Name -contains 'floor') { $floor = $r.floor }
-  $tag  = $null; if ($r.PSObject.Properties.Name -contains 'tag')   { $tag   = $r.tag }
+  # 列名BOM対策
+  $areaCol  = 'area';  $floorCol = 'floor'; $tagCol = 'tag'
+  $bssidCol = 'bssid'; $ssidCol  = 'ssid'
+  $props = @($r.PSObject.Properties.Name)
+  foreach($p in $props){
+    $np = Normalize-HeaderName $p
+    if ($np -eq 'area')  { $areaCol  = $p }
+    if ($np -eq 'floor') { $floorCol = $p }
+    if ($np -eq 'tag')   { $tagCol   = $p }
+    if ($np -eq 'bssid') { $bssidCol = $p }
+    if ($np -eq 'ssid')  { $ssidCol  = $p }
+  }
+
+  $area = Get-Val $r $areaCol
+  $floor= Get-Val $r $floorCol
+  $tag  = Get-Val $r $tagCol
 
   # BSSIDキー
-  if ($r.PSObject.Properties.Name -contains 'bssid') {
-    $binfo = Get-MapKey -raw $r.bssid
+  $bssidRaw = Get-Val $r $bssidCol
+  if ($null -ne $bssidRaw) {
+    $binfo = Get-MapKey -raw $bssidRaw
     if ($binfo.Key) {
       if ($binfo.IsPrefix -or ($binfo.Key.Length -lt 12)) {
         $prefixBssid += @{ Prefix=$binfo.Key; Area=$area; Floor=$floor; Tag=$tag }
@@ -184,9 +238,11 @@ foreach($r in $floorMap){
       }
     }
   }
+
   # SSIDキー
-  if ($r.PSObject.Properties.Name -contains 'ssid') {
-    $sinfo = Get-MapKey -raw $r.ssid -IsSsid
+  $ssidRaw = Get-Val $r $ssidCol
+  if ($null -ne $ssidRaw) {
+    $sinfo = Get-MapKey -raw $ssidRaw -IsSsid
     if ($sinfo.Key) {
       if ($sinfo.IsPrefix) {
         $prefixSsid += @{ Prefix=$sinfo.Key; Area=$area; Floor=$floor; Tag=$tag }
@@ -198,6 +254,13 @@ foreach($r in $floorMap){
     }
   }
 }
+
+# マッチ内訳カウンタ
+$cntMatchBssidExact = 0
+$cntMatchBssidPref  = 0
+$cntMatchSsidExact  = 0
+$cntMatchSsidPref   = 0
+$cntMatchNone       = 0
 
 function Lookup-Meta {
   param([string]$bssidRaw, [string]$ssidRaw)
@@ -211,7 +274,7 @@ function Lookup-Meta {
     $area = $areaByBssidExact[$normB]
     if ($floorByBssidExact.ContainsKey($normB)) { $floor = $floorByBssidExact[$normB] }
     if ($tagByBssidExact.ContainsKey($normB))   { $tag   = $tagByBssidExact[$normB] }
-    $bKey = $normB
+    $bKey = $normB; $script:cntMatchBssidExact++
     return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$bKey }
   }
 
@@ -220,7 +283,7 @@ function Lookup-Meta {
     foreach($p in $prefixBssid){
       $pref = $p.Prefix
       if ($pref -and $normB.StartsWith($pref)) {
-        $area = $p.Area; $floor=$p.Floor; $tag=$p.Tag; $bKey=$normB
+        $area = $p.Area; $floor=$p.Floor; $tag=$p.Tag; $bKey=$normB; $script:cntMatchBssidPref++
         return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$bKey }
       }
     }
@@ -231,6 +294,7 @@ function Lookup-Meta {
     $area = $areaBySsidExact[$normS]
     if ($floorBySsidExact.ContainsKey($normS)) { $floor = $floorBySsidExact[$normS] }
     if ($tagBySsidExact.ContainsKey($normS))   { $tag   = $tagBySsidExact[$normS] }
+    $script:cntMatchSsidExact++
     return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$normB }
   }
 
@@ -239,12 +303,13 @@ function Lookup-Meta {
     foreach($p in $prefixSsid){
       $pref = $p.Prefix
       if ($pref -and $normS.StartsWith($pref)) {
-        $area = $p.Area; $floor=$p.Floor; $tag=$p.Tag
+        $area = $p.Area; $floor=$p.Floor; $tag=$p.Tag; $script:cntMatchSsidPref++
         return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$normB }
       }
     }
   }
 
+  $script:cntMatchNone++
   return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$normB }
 }
 
@@ -253,11 +318,22 @@ $roleByNode    = @{}
 $labelByNode   = @{}
 $segmentByNode = @{}
 foreach($r in $nodeRoles){
-  $k = Safe-Lower $r.ip_or_host
+  $props = @($r.PSObject.Properties.Name)
+  $ipCol = $null; $roleCol=$null; $labelCol=$null; $segCol=$null
+  foreach($p in $props){
+    $np = Normalize-HeaderName $p
+    if ($np -eq 'ip_or_host' -or $np -eq 'host' -or $np -eq 'ip') { $ipCol = $p }
+    if ($np -eq 'role')   { $roleCol  = $p }
+    if ($np -eq 'label')  { $labelCol = $p }
+    if ($np -eq 'segment'){ $segCol   = $p }
+  }
+  $k = Safe-Lower (Get-Val $r $ipCol)
   if (-not [string]::IsNullOrWhiteSpace($k)) {
-    $roleByNode[$k] = $r.role
-    if ($r.PSObject.Properties.Name -contains 'label')   { $labelByNode[$k]   = $r.label }
-    if ($r.PSObject.Properties.Name -contains 'segment') { $segmentByNode[$k] = $r.segment }
+    $roleByNode[$k] = Get-Val $r $roleCol
+    $lv = Get-Val $r $labelCol
+    if ($lv) { $labelByNode[$k]   = $lv }
+    $sv = Get-Val $r $segCol
+    if ($sv) { $segmentByNode[$k] = $sv }
   }
 }
 
@@ -266,20 +342,16 @@ $qual = @()
 $emptyTarget = 0; $emptyBssid = 0; $emptyAp = 0
 
 foreach($q in $qualRaw){
-  $tCol = $colMap.target;   $bCol = $colMap.bssid; $sCol = $colMap.ssid
-  $aCol = $colMap.ap_name;  $tsCol= $colMap.timestamp
-
-  $targetTxt = Get-Val $q $tCol
+  $targetTxt = Get-Val $q $colMap.target
   if ($null -eq $targetTxt) { $emptyTarget++ }
 
-  $bssidRaw = Get-Val $q $bCol
+  $bssidRaw = Get-Val $q $colMap.bssid
   if ($null -eq $bssidRaw) { $emptyBssid++ }
 
-  $ssidRaw  = Get-Val $q $sCol
-
+  $ssidRaw  = Get-Val $q $colMap.ssid
   $meta = Lookup-Meta $bssidRaw $ssidRaw
 
-  $apName = Get-Val $q $aCol
+  $apName = Get-Val $q $colMap.ap_name
   if ($null -eq $apName) { $emptyAp++ }
 
   $rttTxt = Get-Val $q $colMap.rtt_ms
@@ -288,7 +360,7 @@ foreach($q in $qualRaw){
   $mosTxt = Get-Val $q $colMap.mos
 
   $obj = [PSCustomObject]@{
-    timestamp = Get-Val $q $tsCol
+    timestamp = Get-Val $q $colMap.timestamp
     target    = $targetTxt
     rtt_ms    = Parse-Double $rttTxt
     jitter_ms = Parse-Double $jitTxt
@@ -454,10 +526,7 @@ $htmlTemplate = @'
   fillSel(roleSel, uniq(summaryRows.map(function(r){return r.role;})));
   fillSel(segSel,  uniq(summaryRows.map(function(r){return r.segment;})));
 
-  function addInputHandler(el){
-    el.addEventListener('input', render);
-    el.addEventListener('change', render);
-  }
+  function addInputHandler(el){ el.addEventListener('input', render); el.addEventListener('change', render); }
   addInputHandler(areaSel); addInputHandler(apSel); addInputHandler(roleSel);
   addInputHandler(segSel);  addInputHandler(qInput); addInputHandler(includeExternal);
 
@@ -555,11 +624,13 @@ try {
   Write-Warning "WriteAllText に失敗したため Out-File で出力しました。"
 }
 
-# ===== 参考メトリクス（数値のみ表示）=====
+# ===== 参考メトリクス（数値のみ表示、値は出さない）=====
 $total = $qual.Count
 $mapped = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
 if ($total -gt 0) {
   $pct = [math]::Round(100.0 * $mapped / $total, 1)
   Write-Output ("BSSID/SSID→エリア マッピング率: {0}% ({1}/{2})" -f $pct,$mapped,$total)
   Write-Output ("target 空欄: {0} / bssid 空欄: {1} / ap_name 空欄: {2}" -f $emptyTarget,$emptyBssid,$emptyAp)
+  Write-Output ("match内訳: BSSID完全={0}, BSSID接頭辞={1}, SSID完全={2}, SSID接頭辞={3}, 未マッチ={4}" -f `
+    $cntMatchBssidExact, $cntMatchBssidPref, $cntMatchSsidExact, $cntMatchSsidPref, $cntMatchNone)
 }
