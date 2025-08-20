@@ -1,23 +1,19 @@
 <#
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
   - 入力CSV（文字コード）
-    * teams_net_quality.csv（UTF-8 BOM） … 指定ヘッダー:
+    * teams_net_quality.csv（UTF-8 BOM）
       timestamp,target,hop_index,hop_ip,icmp_avg_ms,icmp_jitter_ms,loss_pct,notes,conn_type,ssid,bssid,signal_pct,ap_name,roamed,roam_from,roam_to,host,dns_ms,tcp_443_ms,http_head_ms,mos_estimate,probe,machine,user,tz_offset,source_file
-    * targets.csv（UTF-8） … ヘッダー: role,key,label
-      - role: L2 / L3 / SAAS / RTR_WAN / RTR_LAN
-      - key : FQDN or IP（teams_net_quality.csv の target と一致させる）
-      - label: 機器名やサービス名
-    * node_roles.csv（UTF-8） … ヘッダー: ip_of_host,role,label,segment
+    * targets.csv（UTF-8） … ヘッダー: role,key,label  (key=FQDN or IP)
+      role: L2 / L3 / SAAS / RTR_WAN / RTR_LAN
+    * node_roles.csv（UTF-8） … ヘッダー: ip_of_host,role,label,segment（任意）
     * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag
   - 処理ポリシー
-    * 宛先（target）は必ず targets.csv の key に含まれるもの**のみ**採用（それ以外は除外）
-    * 役割/ラベルは targets.csv を最優先。無い場合のみ node_roles.csv を参照
-    * floors.csv の bssid で area / floor / tag を付与（BSSID正規化・接頭辞「*」不要、完全一致のみ）
+    * **宛先の決定は hop_ip を最優先**（targets.csv の key と一致したら採用）
+      → 一致しなければ target を判定。**どちらにも一致しなければ除外**
+    * 役割/ラベルは targets.csv を最優先。なければ node_roles.csv を補完
+    * floors.csv の bssid を 12桁hex に正規化して area/floor/tag を付与（完全一致）
   - 出力: HTML単一ファイル（UTF-8 BOM, 外部ライブラリ不要）
-  - 注意:
-    * 三項演算子( ?: )は不使用
-    * PowerShellの $Host は未使用
-    * OneDrive/日本語/スペースを含むパス考慮（出力先ディレクトリ自動作成）
+  - 注意: 三項演算子( ?: )不使用 / $Host未使用 / OneDrive・日本語パス対応
 #>
 
 [CmdletBinding()]
@@ -29,7 +25,7 @@ param(
   [string]$OutHtml = ".\NetQuality-Report.html"
 )
 
-# ===== 共通ヘルパ =====
+# ===== ヘルパ =====
 function Parse-Double {
   param([string]$s)
   if ([string]::IsNullOrWhiteSpace($s)) { return $null }
@@ -41,7 +37,7 @@ function Parse-Double {
   return $null
 }
 
-function Get-Median {[CmdletBinding()] param([double[]]$arr)
+function Get-Median { param([double[]]$arr)
   if (-not $arr -or $arr.Count -eq 0) { return $null }
   $s = $arr | Sort-Object
   $n = $s.Count
@@ -50,7 +46,7 @@ function Get-Median {[CmdletBinding()] param([double[]]$arr)
   return ($a + $b) / 2.0
 }
 
-function Get-Percentile {[CmdletBinding()] param([double[]]$arr, [double]$p)
+function Get-Percentile { param([double[]]$arr, [double]$p)
   if (-not $arr -or $arr.Count -eq 0) { return $null }
   $s = $arr | Sort-Object
   $n = $s.Count
@@ -73,10 +69,8 @@ function Normalize-Bssid { param([string]$s)
   return $h
 }
 
-function Import-CsvUtf8 {
-  param([string]$Path)
+function Import-CsvUtf8 { param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return @() }
-  # PS5.1対策: Import-Csv に -Encoding なし。UTF-8(BOM有無)は Get-Content -Encoding UTF8 + ConvertFrom-Csv で統一。
   $lines = Get-Content -LiteralPath $Path -Encoding UTF8
   if ($lines -is [string]) { $lines = @($lines) }
   if ($lines.Count -eq 0) { return @() }
@@ -88,38 +82,37 @@ if (-not (Test-Path -LiteralPath $QualityCsv)) { Write-Error "QualityCsv が見�
 if (-not (Test-Path -LiteralPath $TargetsCsv)) { Write-Error "TargetsCsv が見つかりません: $TargetsCsv"; exit 1 }
 if (-not (Test-Path -LiteralPath $FloorsCsv))  { Write-Error "FloorsCsv が見つかりません: $FloorsCsv"; exit 1 }
 
-$teams  = Import-CsvUtf8 -Path $QualityCsv
-$targets= Import-CsvUtf8 -Path $TargetsCsv
-$roles  = @()
+$teams   = Import-CsvUtf8 -Path $QualityCsv
+$targets = Import-CsvUtf8 -Path $TargetsCsv
+$roles   = @()
 if (Test-Path -LiteralPath $NodeRoleCsv) { $roles = Import-CsvUtf8 -Path $NodeRoleCsv }
-$floors = Import-CsvUtf8 -Path $FloorsCsv
+$floors  = Import-CsvUtf8 -Path $FloorsCsv
 
-# ===== targets.csv を基準にフィルタ＆役割・ラベル優先付与 =====
-# 形式: role,key,label
+# ===== targets.csv を辞書化 =====
 $targetSet     = @{}   # key(lower) => $true
-$roleByTarget  = @{}   # key(lower) => role(大文字のまま)
-$labelByTarget = @{}   # key(lower) => label
+$roleByKey     = @{}   # key(lower) => role
+$labelByKey    = @{}   # key(lower) => label
 foreach($t in $targets){
-  $key = Safe-Lower $t.key
-  if ([string]::IsNullOrWhiteSpace($key)) { continue }
-  if (-not $targetSet.ContainsKey($key)) { $targetSet[$key] = $true }
-  if (-not [string]::IsNullOrWhiteSpace($t.role))  { $roleByTarget[$key]  = $t.role }
-  if (-not [string]::IsNullOrWhiteSpace($t.label)) { $labelByTarget[$key] = $t.label }
+  $k = Safe-Lower $t.key
+  if ([string]::IsNullOrWhiteSpace($k)) { continue }
+  $targetSet[$k] = $true
+  if (-not [string]::IsNullOrWhiteSpace($t.role))  { $roleByKey[$k]  = $t.role }
+  if (-not [string]::IsNullOrWhiteSpace($t.label)) { $labelByKey[$k] = $t.label }
 }
 
-# node_roles.csv（ip_of_host,role,label,segment）… targetsに無いキーの補助情報としてのみ使用
+# node_roles.csv（補助）
 $roleByNode   = @{}
 $labelByNode  = @{}
 $segmentByNode= @{}
 foreach($r in $roles){
-  $k = Safe-Lower $r.ip_of_host
-  if ([string]::IsNullOrWhiteSpace($k)) { continue }
-  if (-not [string]::IsNullOrWhiteSpace($r.role))   { $roleByNode[$k]   = $r.role }
-  if (-not [string]::IsNullOrWhiteSpace($r.label))  { $labelByNode[$k]  = $r.label }
-  if (-not [string]::IsNullOrWhiteSpace($r.segment)){ $segmentByNode[$k]= $r.segment }
+  $nk = Safe-Lower $r.ip_of_host
+  if ([string]::IsNullOrWhiteSpace($nk)) { continue }
+  if (-not [string]::IsNullOrWhiteSpace($r.role))    { $roleByNode[$nk]   = $r.role }
+  if (-not [string]::IsNullOrWhiteSpace($r.label))   { $labelByNode[$nk]  = $r.label }
+  if (-not [string]::IsNullOrWhiteSpace($r.segment)) { $segmentByNode[$nk]= $r.segment }
 }
 
-# floors.csv（bssid,area,floor,tag）→ BSSID完全一致辞書
+# floors.csv（BSSID完全一致）
 $areaByBssid  = @{}
 $floorByBssid = @{}
 $tagByBssid   = @{}
@@ -131,44 +124,52 @@ foreach($f in $floors){
   if (-not [string]::IsNullOrWhiteSpace($f.tag))   { $tagByBssid[$b]   = $f.tag }
 }
 
-# ===== teams_net_quality.csv を targets に含まれる宛先だけに絞る =====
-$filtered = @()
-$droppedNotInTargets = 0
-foreach($row in $teams){
-  $tgt = Safe-Lower $row.target
-  if ([string]::IsNullOrWhiteSpace($tgt)) { $droppedNotInTargets++; continue }
-  if (-not $targetSet.ContainsKey($tgt)) { $droppedNotInTargets++; continue }
-  $filtered += $row
-}
-Write-Output ("targets.csvに含まれない宛先を除外: {0}件" -f $droppedNotInTargets)
-
-# ===== 正規化 & マッピング =====
+# ===== 正規化 & マッチング（hop_ip を優先）=====
 $qual = @()
+$cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
 $emptyBssid = 0; $emptyAp = 0
-foreach($q in $filtered){
+
+foreach($q in $teams){
+  $hopKey = Safe-Lower $q.hop_ip
+  $tgtKey = Safe-Lower $q.target
+
+  $matchKey = $null
+  $matchRole = $null
+  $matchLabel = $null
+  $segmentVal = ""
+
+  # hop_ip → target の順で一致判定
+  if (-not [string]::IsNullOrWhiteSpace($hopKey) -and $targetSet.ContainsKey($hopKey)) {
+    $matchKey = $hopKey
+    if ($roleByKey.ContainsKey($hopKey))  { $matchRole  = $roleByKey[$hopKey] }
+    if ($labelByKey.ContainsKey($hopKey)) { $matchLabel = $labelByKey[$hopKey] }
+    if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
+    $cntMatchHop++
+  } elseif (-not [string]::IsNullOrWhiteSpace($tgtKey) -and $targetSet.ContainsKey($tgtKey)) {
+    $matchKey = $tgtKey
+    if ($roleByKey.ContainsKey($tgtKey))  { $matchRole  = $roleByKey[$tgtKey] }
+    if ($labelByKey.ContainsKey($tgtKey)) { $matchLabel = $labelByKey[$tgtKey] }
+    if ($segmentByNode.ContainsKey($tgtKey)) { $segmentVal = $segmentByNode[$tgtKey] }
+    $cntMatchTarget++
+  } else {
+    $cntDropped++
+    continue
+  }
+
+  # 役割/ラベルの最終補完（targetsに無い時だけ node_roles を見る）
+  if ([string]::IsNullOrWhiteSpace($matchRole) -and $roleByNode.ContainsKey($matchKey))  { $matchRole  = $roleByNode[$matchKey] }
+  if ([string]::IsNullOrWhiteSpace($matchLabel) -and $labelByNode.ContainsKey($matchKey)){ $matchLabel = $labelByNode[$matchKey] }
+
+  # floors: BSSID → area/floor/tag
   $bNorm = Normalize-Bssid $q.bssid
   if ($null -eq $bNorm) { $emptyBssid++ }
   $apName = $q.ap_name
   if ([string]::IsNullOrWhiteSpace($apName)) { $emptyAp++ }
 
-  # floors の area/floor/tag
   $areaVal = "Unknown"; $floorVal = $null; $tagVal = $null
   if ($bNorm -and $areaByBssid.ContainsKey($bNorm)) { $areaVal = $areaByBssid[$bNorm] }
   if ($bNorm -and $floorByBssid.ContainsKey($bNorm)) { $floorVal = $floorByBssid[$bNorm] }
   if ($bNorm -and $tagByBssid.ContainsKey($bNorm))   { $tagVal   = $tagByBssid[$bNorm] }
-
-  # role/label/segment の優先順位: targets.csv ＞ node_roles.csv ＞ 既定
-  $key = Safe-Lower $q.target
-  $roleVal = "Uncategorized"
-  if ($roleByTarget.ContainsKey($key)) { $roleVal = $roleByTarget[$key] }
-  elseif ($roleByNode.ContainsKey($key)) { $roleVal = $roleByNode[$key] }
-
-  $labelVal = $q.target
-  if ($labelByTarget.ContainsKey($key)) { $labelVal = $labelByTarget[$key] }
-  elseif ($labelByNode.ContainsKey($key)) { $labelVal = $labelByNode[$key] }
-
-  $segVal = ""
-  if ($segmentByNode.ContainsKey($key)) { $segVal = $segmentByNode[$key] }
 
   # 数値系
   $rtt  = Parse-Double $q.icmp_avg_ms
@@ -181,7 +182,7 @@ foreach($q in $filtered){
 
   $obj = [PSCustomObject]@{
     timestamp = $q.timestamp
-    target    = $q.target
+    target    = $matchKey      # ← 実際にマッチしたキー（hop_ip または target）
     rtt_ms    = $rtt
     jitter_ms = $jit
     loss_pct  = $loss
@@ -192,9 +193,9 @@ foreach($q in $filtered){
     area      = $areaVal
     floor     = $floorVal
     ap_tag    = $tagVal
-    role      = $roleVal
-    label     = $labelVal
-    segment   = $segVal
+    role      = if ($matchRole) { $matchRole } else { "Uncategorized" }
+    label     = if ($matchLabel){ $matchLabel } else { $matchKey }
+    segment   = $segmentVal
   }
   $qual += $obj
 }
@@ -229,41 +230,28 @@ foreach($g in $groups){
   }
 }
 
-# ===== HTML テンプレ生成（@' … '@ + JSON置換）=====
+# ===== HTML（@'…'@ + JSON置換, UTF-8 BOM出力）=====
 $summaryJson = $summaryRows | ConvertTo-Json -Depth 5
 
 $htmlTemplate = @'
 <!doctype html>
-<html lang="ja">
-<head>
+<html lang="ja"><head>
 <meta charset="utf-8" />
-<title>NetQuality Report (Targets-Filtered)</title>
+<title>NetQuality Report (Targets+Hop Match)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; margin: 16px; }
   h1 { font-size: 20px; margin: 0 0 12px; }
   .filters { display:flex; gap:8px; flex-wrap: wrap; margin: 8px 0 16px; }
   select, input, label { padding:6px; border:1px solid #ccc; border-radius: 8px; }
-  label.chk { border:none; padding:0 6px 0 0; }
   table { border-collapse: collapse; width: 100%; margin: 8px 0 24px; }
   th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
   th { background: #fafafa; position: sticky; top:0; z-index: 1; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-  .hint { color:#666; font-size:12px; }
-  .legend { font-size:12px; color:#444; margin:4px 0 12px; }
-  .legend span { margin-right:12px; padding:2px 6px; border-radius:6px; }
-  .rt-ok   { background:#e7f7e7; }
-  .rt-warn { background:#fff5e0; }
-  .rt-bad  { background:#fdecec; }
-  .loss-bad{ background:#fdecec; }
-  .muted { color:#777; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; }
+  .rt-ok{background:#e7f7e7;} .rt-warn{background:#fff5e0;} .rt-bad{background:#fdecec;} .loss-bad{background:#fdecec;}
 </style>
-</head>
-<body>
-  <h1>ネットワーク品質レポート（targets.csv で宛先を絞り込み）</h1>
-  <div class="hint">
-    このレポートは <strong>targets.csv の key に含まれる target のみ</strong>を集計しています。floors.csv の BSSID から area/floor/tag を付与しています。
-  </div>
+</head><body>
+  <h1>ネットワーク品質レポート（targets.csv × hop_ip優先照合）</h1>
 
   <div class="filters">
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
@@ -273,127 +261,67 @@ $htmlTemplate = @'
     <select id="segSel"><option value="">(すべてのセグメント)</option></select>
   </div>
 
-  <div class="legend">
-    <span class="rt-ok">RTT &lt; 50ms</span>
-    <span class="rt-warn">50–100ms</span>
-    <span class="rt-bad">≥ 100ms</span>
-    <span class="loss-bad">損失 &gt; 3%</span>
-  </div>
-
   <table id="sumTbl">
-    <thead>
-      <tr>
-        <th>エリア</th>
-        <th>AP</th>
-        <th>対象</th>
-        <th>役割</th>
-        <th>セグメント</th>
-        <th>試行数</th>
-        <th>RTT中央値</th>
-        <th>RTT P95</th>
-        <th>ジッタ中央値</th>
-        <th>損失率(平均)</th>
-        <th>MOS(中央値)</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
+    <thead><tr>
+      <th>エリア</th><th>AP</th><th>対象(キー)</th><th>役割</th><th>セグメント</th>
+      <th>試行数</th><th>RTT中央値</th><th>RTT P95</th><th>ジッタ中央値</th><th>損失率(平均)</th><th>MOS(中央値)</th>
+    </tr></thead><tbody></tbody>
   </table>
 
 <script>
-  var summaryRows = __SUMMARY_JSON__;
+var summaryRows = __SUMMARY_JSON__;
 
-  function uniq(vals){
-    var out = [];
-    for (var i=0;i<vals.length;i++){
-      var x = vals[i];
-      if (x && out.indexOf(x) === -1) { out.push(x); }
-    }
-    out.sort();
-    return out;
+function uniq(a){var o=[],i;for(i=0;i<a.length;i++){var x=a[i];if(x&&o.indexOf(x)===-1)o.push(x);}o.sort();return o;}
+function fillSel(el,opts){for(var i=0;i<opts.length;i++){var op=document.createElement('option');op.textContent=opts[i];op.value=opts[i];el.appendChild(op);}}
+var areaSel=document.getElementById('areaSel'),apSel=document.getElementById('apSel'),roleSel=document.getElementById('roleSel'),segSel=document.getElementById('segSel'),qInput=document.getElementById('targetSearch');
+fillSel(areaSel,uniq(summaryRows.map(function(r){return r.area;})));
+fillSel(apSel,uniq(summaryRows.map(function(r){return r.ap_name;}).filter(function(x){return !!x;})));
+fillSel(roleSel,uniq(summaryRows.map(function(r){return r.role;})));
+fillSel(segSel,uniq(summaryRows.map(function(r){return r.segment;})));
+[areaSel,apSel,roleSel,segSel,qInput].forEach(function(el){el.addEventListener('input',render);el.addEventListener('change',render);});
+
+function colorRtt(td,v){if(v==null)return;if(v<50)td.classList.add('rt-ok');else if(v<100)td.classList.add('rt-warn');else td.classList.add('rt-bad');}
+function colorLoss(td,v){if(v!=null&&v>3)td.classList.add('loss-bad');}
+
+function render(){
+  var area=areaSel.value||"",ap=apSel.value||"",role=roleSel.value||"",seg=segSel.value||"",q=(qInput.value||"").toLowerCase();
+  var tbody=document.querySelector('#sumTbl tbody'); tbody.innerHTML='';
+  var rows=summaryRows.slice().sort(function(a,b){
+    var ka=(a.area||"")+"|"+(a.ap_name||""); var kb=(b.area||"")+"|"+(b.ap_name||"");
+    if(ka<kb)return-1;if(ka>kb)return 1; var ra=-1;if(a.rtt_med!=null)ra=-a.rtt_med; var rb=-1;if(b.rtt_med!=null)rb=-b.rtt_med; return ra-rb;
+  });
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    if(area && r.area!==area)continue;
+    if(ap && (r.ap_name||"")!==ap)continue;
+    if(role && r.role!==role)continue;
+    if(seg && r.segment!==seg)continue;
+    if(q && String(r.target||"").toLowerCase().indexOf(q)===-1)continue;
+
+    var tr=document.createElement('tr');
+    function td(t){var e=document.createElement('td'); e.textContent=(t==null?"":t); return e;}
+
+    tr.appendChild(td(r.area));
+    tr.appendChild(td(r.ap_name||""));
+
+    var ttd=td(r.target); ttd.classList.add('mono'); tr.appendChild(ttd);
+
+    tr.appendChild(td(r.role||""));
+    tr.appendChild(td(r.segment||""));
+    tr.appendChild(td(r.count));
+
+    var rttm=td(r.rtt_med); colorRtt(rttm,r.rtt_med); tr.appendChild(rttm);
+    var rttp=td(r.rtt_p95); colorRtt(rttp,r.rtt_p95); tr.appendChild(rttp);
+    tr.appendChild(td(r.jit_med));
+    var loss=td(r.loss_avg); colorLoss(loss,r.loss_avg); tr.appendChild(loss);
+    tr.appendChild(td(r.mos_med));
+
+    tbody.appendChild(tr);
   }
-  function fillSel(el, opts){
-    for (var i=0;i<opts.length;i++){
-      var op = document.createElement('option');
-      op.textContent = opts[i]; op.value = opts[i];
-      el.appendChild(op);
-    }
-  }
-  var areaSel = document.getElementById('areaSel');
-  var apSel   = document.getElementById('apSel');
-  var roleSel = document.getElementById('roleSel');
-  var segSel  = document.getElementById('segSel');
-  var qInput  = document.getElementById('targetSearch');
-
-  fillSel(areaSel, uniq(summaryRows.map(function(r){return r.area;})));
-  fillSel(apSel,   uniq(summaryRows.map(function(r){return r.ap_name;}).filter(function(x){return !!x;})));
-  fillSel(roleSel, uniq(summaryRows.map(function(r){return r.role;})));
-  fillSel(segSel,  uniq(summaryRows.map(function(r){return r.segment;})));
-
-  function addInputHandler(el){ el.addEventListener('input', render); el.addEventListener('change', render); }
-  addInputHandler(areaSel); addInputHandler(apSel); addInputHandler(roleSel); addInputHandler(segSel); addInputHandler(qInput);
-
-  function colorRtt(td, val){
-    if (val == null) return;
-    if (val < 50) td.classList.add('rt-ok');
-    else if (val < 100) td.classList.add('rt-warn');
-    else td.classList.add('rt-bad');
-  }
-  function colorLoss(td, val){ if (val != null && val > 3) td.classList.add('loss-bad'); }
-
-  function render(){
-    var area = areaSel.value || "";
-    var ap   = apSel.value || "";
-    var role = roleSel.value || "";
-    var seg  = segSel.value || "";
-    var q    = (qInput.value || "").toLowerCase();
-
-    var tbody = document.querySelector('#sumTbl tbody');
-    tbody.innerHTML = '';
-
-    var rows = summaryRows.slice().sort(function(a,b){
-      var ka = (a.area||"") + "|" + (a.ap_name||"");
-      var kb = (b.area||"") + "|" + (b.ap_name||"");
-      if (ka < kb) return -1;
-      if (ka > kb) return 1;
-      var ra = -1; if (a.rtt_med != null) { ra = -a.rtt_med; }
-      var rb = -1; if (b.rtt_med != null) { rb = -b.rtt_med; }
-      return ra - rb;
-    });
-
-    for (var i=0;i<rows.length;i++){
-      var r = rows[i];
-      if (area && r.area !== area) continue;
-      if (ap && (r.ap_name||"") !== ap) continue;
-      if (role && r.role !== role) continue;
-      if (seg && r.segment !== seg) continue;
-      if (q && String(r.target||"").toLowerCase().indexOf(q) === -1) continue;
-
-      var tr = document.createElement('tr');
-      function td(t){ var e=document.createElement('td'); e.textContent = (t==null?"":t); return e; }
-
-      tr.appendChild(td(r.area));
-      tr.appendChild(td(r.ap_name||""));
-
-      var ttd = td(r.target); ttd.classList.add('mono'); tr.appendChild(ttd);
-
-      tr.appendChild(td(r.role||""));
-      tr.appendChild(td(r.segment||""));
-      tr.appendChild(td(r.count));
-
-      var rttm = td(r.rtt_med); colorRtt(rttm, r.rtt_med); tr.appendChild(rttm);
-      var rttp = td(r.rtt_p95); colorRtt(rttp, r.rtt_p95); tr.appendChild(rttp);
-      tr.appendChild(td(r.jit_med));
-      var loss = td(r.loss_avg); colorLoss(loss, r.loss_avg); tr.appendChild(loss);
-      tr.appendChild(td(r.mos_med));
-
-      tbody.appendChild(tr);
-    }
-  }
-
-  render();
+}
+render();
 </script>
-</body>
-</html>
+</body></html>
 '@
 
 $html = $htmlTemplate.Replace('__SUMMARY_JSON__', $summaryJson)
@@ -413,7 +341,7 @@ try {
   Write-Warning "WriteAllText に失敗したため Out-File で出力しました。"
 }
 
-# ===== 参考メトリクス（数値のみ。実データは表示しません）=====
+# ===== 参考メトリクス（数値のみ表示）=====
 $total = $teams.Count
 $after = $qual.Count
 $mappedArea = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
@@ -421,7 +349,8 @@ if ($total -gt 0) {
   $pctUsed = [math]::Round(100.0 * $after / $total, 1)
   $pctArea = 0.0
   if ($after -gt 0) { $pctArea = [math]::Round(100.0 * $mappedArea / $after, 1) }
-  Write-Output ("teams行数: {0}, フィルタ後: {1} ({2}%)" -f $total,$after,$pctUsed)
+  Write-Output ("teams行数: {0}, 採用行数( targets×(hop_ip→target) ): {1} ({2}%)" -f $total,$after,$pctUsed)
   Write-Output ("area付与率（Unknown除外）: {0}% ({1}/{2})" -f $pctArea,$mappedArea,$after)
+  Write-Output ("hop_ipで一致: {0} / targetで一致: {1} / 除外: {2}" -f $cntMatchHop,$cntMatchTarget,$cntDropped)
   Write-Output ("bssid空欄: {0} / ap_name空欄: {1}" -f $emptyBssid,$emptyAp)
 }
