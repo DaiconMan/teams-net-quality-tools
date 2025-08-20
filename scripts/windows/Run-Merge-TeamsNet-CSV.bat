@@ -5,13 +5,12 @@ chcp 932 >nul 2>&1
 rem ===================== 設定 =====================
 set "SCRIPT=Merge-TeamsNet-CSV.ps1"
 
-rem セミコロン(;)区切りで“ディレクトリ”を列挙してください
+rem セミコロン(;)区切りで“ディレクトリ”を列挙
 rem 例: set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
 rem 例: set "FOLDERS=.\部署A\8F 東;.\部署B\10F 西"
 set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
 
-rem タグ（; 区切り）。空なら各ディレクトリの末端名を自動採用します
-rem 例: set "TAGS=8F-A;10F-B"
+rem タグ（; 区切り）。空なら各ディレクトリの末端名を自動採用
 set "TAGS="
 
 rem 1=サブフォルダも再帰、0=直下のみ
@@ -30,7 +29,7 @@ rem ================ ここから処理 ================
 set "UNIT_LIST="
 set "TAG_LIST="
 
-rem -- セミコロン分割を安全に処理 --
+rem セミコロン分割を安全に処理
 set "REST=%FOLDERS%"
 :__split_loop
 if not defined REST goto __split_done
@@ -53,6 +52,14 @@ if "%UNIT_LIST%"=="" (
   exit /b 1
 )
 
+rem RECURSE=1/0 を PS の switch 引数に変換
+set "PS_RECURSE_ARG="
+if "%RECURSE%"=="1" (
+  set "PS_RECURSE_ARG=-Recurse:$true"
+) else (
+  set "PS_RECURSE_ARG=-Recurse:$false"
+)
+
 rem PowerShell 実行
 if "%SPLIT_BY_DATE%"=="1" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" ^
@@ -62,13 +69,13 @@ if "%SPLIT_BY_DATE%"=="1" (
     -DateColumn "%DATE_COLUMN%" ^
     -DateFormat "%DATE_FORMAT%" ^
     -OutputDir "%OUTPUT_DIR%" ^
-    -Recurse:!RECURSE!
+    %PS_RECURSE_ARG%
 ) else (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" ^
     -InputCsvs "%UNIT_LIST%" ^
     -Tags "%TAG_LIST%" ^
     -Output "%OUTPUT%" ^
-    -Recurse:!RECURSE!
+    %PS_RECURSE_ARG%
 )
 
 exit /b !ERRORLEVEL!
