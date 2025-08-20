@@ -11,8 +11,9 @@
 .PARAMETER TagColumn
   Tag 列の明示指定（既定: 自動検出: probe|tag|location）
 
-.PARAMETER HostColumn
-  Host 列の明示指定（既定: 自動検出: target|host|hostname|dst|endpoint|server）
+.PARAMETER TargetColumn
+  Target 列の明示指定（既定: 自動検出: target|host|hostname|dst|endpoint|server）
+  ※互換のため -HostColumn エイリアスも受理します（内部では使いません）
 
 .PARAMETER LatencyColumn
   レイテンシ列の明示指定（既定: 自動検出: rtt_ms|rtt|latency_ms|latency|avg_ms|response_ms）
@@ -24,9 +25,9 @@
   Output\TagSummary.xlsx, Output\TagSummary.csv
 
 .NOTES
-  - Excel COM を使用（Officeがない環境ではCSVのみ出力）
+  - Excel COM を使用（Office がない環境では CSV のみ出力）
   - 列名は大小区別せず照合
-  - PowerShell 5.1 互換（Measure-Object 等の基本機能のみ）
+  - PowerShell 5.1 互換
 #>
 
 [CmdletBinding()]
@@ -38,7 +39,8 @@ param(
 
   [string]$TagColumn,
 
-  [string]$HostColumn,
+  [Alias('HostColumn')]
+  [string]$TargetColumn,
 
   [string]$LatencyColumn,
 
@@ -65,10 +67,10 @@ function Detect-Columns($Headers){
   $h = @($Headers | ForEach-Object { ($_ -as [string]).ToLowerInvariant() })
 
   $tag = Find-FirstPresentColumn $h @('probe','tag','location')
-  $host = Find-FirstPresentColumn $h @('target','host','hostname','dst','endpoint','server')
-  $lat  = Find-FirstPresentColumn $h @('rtt_ms','rtt','latency_ms','latency','avg_ms','response_ms')
+  $tgt = Find-FirstPresentColumn $h @('target','host','hostname','dst','endpoint','server')
+  $lat = Find-FirstPresentColumn $h @('rtt_ms','rtt','latency_ms','latency','avg_ms','response_ms')
 
-  @{ Tag=$tag; Host=$host; Latency=$lat }
+  @{ Tag=$tag; Target=$tgt; Latency=$lat }
 }
 
 function Percentile([double[]]$values, [double]$p){
@@ -98,7 +100,6 @@ try{
 
   Write-Info "Loading CSV: $CsvPath"
   $rows = Import-Csv -LiteralPath $CsvPath
-
   if(-not $rows){ throw "CSV rows are empty." }
 
   # ヘッダ取得（小文字化）
@@ -106,42 +107,42 @@ try{
 
   # 列自動検出または指定優先
   $det = Detect-Columns $headersLower
-  $tagCol  = if($TagColumn){ $TagColumn } else { $det.Tag }
-  $hostCol = if($HostColumn){ $HostColumn } else { $det.Host }
-  $latCol  = if($LatencyColumn){ $LatencyColumn } else { $det.Latency }
+  $tagCol = if($TagColumn){ $TagColumn } else { $det.Tag }
+  $tgtCol = if($TargetColumn){ $TargetColumn } else { $det.Target }
+  $latCol = if($LatencyColumn){ $LatencyColumn } else { $det.Latency }
 
   if(-not $tagCol){ throw "Tag 列が見つかりません。-TagColumn で指定するか、CSV に probe|tag|location のいずれかの列を含めてください。" }
   if(-not $latCol){ throw "レイテンシ列が見つかりません。-LatencyColumn で指定するか、CSV に rtt_ms|rtt|latency_ms|latency|avg_ms|response_ms のいずれかの列を含めてください。" }
 
-  Write-Info ("Using columns -> Tag:'{0}', Host:'{1}', Latency:'{2}'" -f $tagCol,$hostCol,$latCol)
+  Write-Info ("Using columns -> Tag:'{0}', Target:'{1}', Latency:'{2}'" -f $tagCol,$tgtCol,$latCol)
 
   # 正規化して投影
   $proj = foreach($r in $rows){
-    $tag  = ($r.$tagCol) -as [string]
-    $host = if($hostCol){ ($r.$hostCol) -as [string] } else { $null }
-    # 数値化（文字の '123ms' にも一部対応）
+    $tag = ($r.$tagCol) -as [string]
+    $tgt = if($tgtCol){ ($r.$tgtCol) -as [string] } else { $null }
+
+    # 数値化（'123ms' 形式にも一部対応）
     $raw = ($r.$latCol) -as [string]
     if($raw -match '([-+]?\d+(\.\d+)?)'){ $lat = [double]$matches[1] } else { $lat = $null }
 
     [pscustomobject]@{
       Tag = $tag
-      Host = if($host){ $host } else { "_(all)" }
+      Target = if($tgt){ $tgt } else { "_(all)" }
       LatencyMs = $lat
     }
   }
 
   # 欠損除外
   $proj = $proj | Where-Object { $_.LatencyMs -ne $null }
-
   if(-not $proj){ throw "有効なレイテンシ行がありません（数値に変換できませんでした）。" }
 
-  # 集計（Tag, Host）
-  Write-Info "Aggregating by Tag/Host..."
-  $grouped = $proj | Group-Object Tag, Host
+  # 集計（Tag, Target）
+  Write-Info "Aggregating by Tag/Target..."
+  $grouped = $proj | Group-Object Tag, Target
 
   $outRows = foreach($g in $grouped){
     $tag = $g.Group[0].Tag
-    $host = $g.Group[0].Host
+    $tgt = $g.Group[0].Target
     $vals = @($g.Group | ForEach-Object { $_.LatencyMs })
     $n = $vals.Count
     $avg = [math]::Round(($vals | Measure-Object -Average).Average, 1)
@@ -151,7 +152,7 @@ try{
 
     [pscustomobject]@{
       Tag = if([string]::IsNullOrWhiteSpace($tag)){"_(blank)"}else{$tag}
-      Host = $host
+      Target = $tgt
       Samples = $n
       AvgMs = $avg
       P95Ms = $p95
@@ -159,7 +160,7 @@ try{
       OverThresholdPct = $overPct
       ThresholdMs = $ThresholdMs
     }
-  } | Sort-Object Tag, Host
+  } | Sort-Object Tag, Target
 
   # CSV 出力
   $csvOut = Join-Path $Output "TagSummary.csv"
@@ -182,14 +183,14 @@ try{
       # Summary シート
       $ws = $wb.Worksheets.Item(1)
       $ws.Name = "Summary"
-      $headers = @('Tag','Host','Samples','AvgMs','P95Ms','OverThresholdCount','OverThresholdPct','ThresholdMs')
+      $headers = @('Tag','Target','Samples','AvgMs','P95Ms','OverThresholdCount','OverThresholdPct','ThresholdMs')
       for($i=0;$i -lt $headers.Count;$i++){
         $ws.Cells.Item(1, $i+1) = $headers[$i]
       }
       $row = 2
       foreach($r in $outRows){
         $ws.Cells.Item($row,1) = $r.Tag
-        $ws.Cells.Item($row,2) = $r.Host
+        $ws.Cells.Item($row,2) = $r.Target
         $ws.Cells.Item($row,3) = $r.Samples
         $ws.Cells.Item($row,4) = $r.AvgMs
         $ws.Cells.Item($row,5) = $r.P95Ms
@@ -198,20 +199,20 @@ try{
         $ws.Cells.Item($row,8) = $r.ThresholdMs
         $row++
       }
-      # Tagごとに別シート（必要最小限の表）
+      # Tag ごとに別シート
       $byTag = $outRows | Group-Object Tag
       foreach($tg in $byTag){
         $name = Sanitize-WorksheetName $tg.Name
         $sheet = $wb.Worksheets.Add()
-        $sheet.Move($ws) | Out-Null
+        $null = $sheet.Move($ws)   # 先頭へ
         $sheet.Name = $name
         for($i=0;$i -lt $headers.Count;$i++){
           $sheet.Cells.Item(1, $i+1) = $headers[$i]
         }
         $ridx = 2
-        foreach($r in ($tg.Group | Sort-Object Host)){
+        foreach($r in ($tg.Group | Sort-Object Target)){
           $sheet.Cells.Item($ridx,1) = $r.Tag
-          $sheet.Cells.Item($ridx,2) = $r.Host
+          $sheet.Cells.Item($ridx,2) = $r.Target
           $sheet.Cells.Item($ridx,3) = $r.Samples
           $sheet.Cells.Item($ridx,4) = $r.AvgMs
           $sheet.Cells.Item($ridx,5) = $r.P95Ms
@@ -222,10 +223,11 @@ try{
         }
       }
 
-      # 体裁（見出し太字＋オートフィット）
-      foreach($s in $wb.Worksheets){
-        $s.Rows.Item(1).Font.Bold = $true | Out-Null
-        $s.Columns.AutoFit() | Out-Null
+      # 体裁
+      for($i=1; $i -le $wb.Worksheets.Count; $i++){
+        $s = $wb.Worksheets.Item($i)
+        $s.Rows.Item(1).Font.Bold = $true
+        $null = $s.Columns.AutoFit()
       }
 
       Write-Info "Saving Excel: $xlsxOut"
@@ -233,7 +235,7 @@ try{
       $wb.Close($true)
     }finally{
       $excel.Quit() | Out-Null
-      [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+      [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel)
     }
   }
 
