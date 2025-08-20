@@ -1,11 +1,11 @@
 <#
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
-  - 入力: teams_net_quality.csv（Measure-NetQuality-WithHops.ps1 が出力した品質CSV）
-  - 補正: floor.csv (BSSID→エリア), node_roles.csv (IP/FQDN→役割/ラベル/セグメント)
+  - 入力: teams_net_quality.csv（Measure-NetQuality-WithHops.ps1 の品質CSV）
+  - 補正: floor.csv (BSSID→エリア/階/tag), node_roles.csv (IP/FQDN→役割/ラベル/セグメント)
   - 出力: HTML 単一ファイル（外部ライブラリ不要）
-  - 仕様: path_hop_quality.csv は解析しない（ZscalerによりInternetのPingは信頼しない想定）
-  - 既定で SaaS / Internet は一覧から除外（HTML内のトグルで含めることも可）
-  - 注意: PowerShellの自動変数 $Host を避けるため、対象はプロパティ名 'target' を使用
+  - 仕様: path_hop_quality.csv は解析しない（ZscalerによりInternet/SaaS向けpingは信頼しない想定）
+  - 既定で SaaS / Internet は一覧から除外（HTML内のトグルで含め可能）
+  - 注意: PowerShellの $Host は未使用。CSVの列名 host は target として扱う。
 
   使い方例:
     powershell -ExecutionPolicy Bypass -File .\Generate-NetQuality-HTMLReport.ps1 `
@@ -86,9 +86,9 @@ foreach($r in $floorMap){
 }
 
 # ノード（IP/FQDN）→役割/ラベル/セグメント
-$roleByNode   = @{}
-$labelByNode  = @{}
-$segmentByNode= @{}
+$roleByNode    = @{}
+$labelByNode   = @{}
+$segmentByNode = @{}
 foreach($r in $nodeRoles){
   $k = Safe-Lower $r.ip_or_host
   $roleByNode[$k] = $r.role
@@ -101,7 +101,18 @@ foreach($r in $nodeRoles){
 $qual = @()
 foreach($q in $qualRaw){
   $bssidNorm = Safe-Lower $q.bssid
-  $targetTxt = $q.host # カラム名は host 想定だが、自動変数 $Host と衝突しないよう変数名には格納しない
+  $targetTxt = $q.host
+
+  # area/floor/tag を辞書から取得（PS5.1のため三項演算子は使わない）
+  $areaVal = "Unknown"
+  if ($areaByBssid.ContainsKey($bssidNorm)) { $areaVal = $areaByBssid[$bssidNorm] }
+
+  $floorVal = $null
+  if ($floorByBssid.ContainsKey($bssidNorm)) { $floorVal = $floorByBssid[$bssidNorm] }
+
+  $tagVal = $null
+  if ($tagByBssid.ContainsKey($bssidNorm)) { $tagVal = $tagByBssid[$bssidNorm] }
+
   $obj = [PSCustomObject]@{
     timestamp = $q.timestamp
     target    = $targetTxt
@@ -112,20 +123,30 @@ foreach($q in $qualRaw){
     ssid      = $q.ssid
     bssid     = $bssidNorm
     ap_name   = $q.ap_name
-    area      = ($areaByBssid.ContainsKey($bssidNorm) ? $areaByBssid[$bssidNorm] : "Unknown")
-    floor     = ($floorByBssid.ContainsKey($bssidNorm) ? $floorByBssid[$bssidNorm] : $null)
-    ap_tag    = ($tagByBssid.ContainsKey($bssidNorm)   ? $tagByBssid[$bssidNorm]   : $null)
+    area      = $areaVal
+    floor     = $floorVal
+    ap_tag    = $tagVal
   }
-  # MOS 未計算時は簡易推定（閾値色分けが主用途）
+
+  # MOS 未計算時は簡易推定
   if ($null -eq $obj.mos -and $null -ne $obj.rtt_ms -and $null -ne $obj.loss_pct) {
     $obj.mos = [math]::Round((4.5 - 0.0004*[double]$obj.rtt_ms - 0.1*[double]$obj.loss_pct),2)
   }
 
-  # 役割・ラベル・セグメント付与（SaaS/Internetは後段で既定除外）
+  # 役割・ラベル・セグメント付与（三項演算子は使わず if で代入）
   $nk = Safe-Lower $obj.target
-  $obj | Add-Member -NotePropertyName role    -NotePropertyValue ($roleByNode.ContainsKey($nk) ? $roleByNode[$nk] : "Uncategorized")
-  $obj | Add-Member -NotePropertyName label   -NotePropertyValue ($labelByNode.ContainsKey($nk) ? $labelByNode[$nk] : $obj.target)
-  $obj | Add-Member -NotePropertyName segment -NotePropertyValue ($segmentByNode.ContainsKey($nk) ? $segmentByNode[$nk] : "")
+
+  $roleVal = "Uncategorized"
+  if ($roleByNode.ContainsKey($nk)) { $roleVal = $roleByNode[$nk] }
+  $obj | Add-Member -NotePropertyName role -NotePropertyValue $roleVal
+
+  $labelVal = $obj.target
+  if ($labelByNode.ContainsKey($nk)) { $labelVal = $labelByNode[$nk] }
+  $obj | Add-Member -NotePropertyName label -NotePropertyValue $labelVal
+
+  $segVal = ""
+  if ($segmentByNode.ContainsKey($nk)) { $segVal = $segmentByNode[$nk] }
+  $obj | Add-Member -NotePropertyName segment -NotePropertyValue $segVal
 
   $qual += $obj
 }
@@ -134,10 +155,16 @@ foreach($q in $qualRaw){
 $summaryRows = @()
 $groups = $qual | Group-Object -Property area, ap_name, target, role, segment
 foreach($g in $groups){
-  $rtts = @($g.Group | Where-Object {$_.rtt_ms -ne $null} | ForEach-Object {[double]$_.rtt_ms})
+  $rtts = @($g.Group | Where-Object {$_.rtt_ms -ne $null}    | ForEach-Object {[double]$_.rtt_ms})
   $jits = @($g.Group | Where-Object {$_.jitter_ms -ne $null} | ForEach-Object {[double]$_.jitter_ms})
-  $loss = @($g.Group | Where-Object {$_.loss_pct -ne $null} | ForEach-Object {[double]$_.loss_pct})
-  $mosv = @($g.Group | Where-Object {$_.mos -ne $null} | ForEach-Object {[double]$_.mos})
+  $loss = @($g.Group | Where-Object {$_.loss_pct -ne $null}  | ForEach-Object {[double]$_.loss_pct})
+  $mosv = @($g.Group | Where-Object {$_.mos -ne $null}       | ForEach-Object {[double]$_.mos})
+
+  $rtt_med = $null; if($rtts.Count -gt 0){ $rtt_med = [math]::Round((Get-Median $rtts),1) }
+  $rtt_p95 = $null; if($rtts.Count -gt 0){ $rtt_p95 = [math]::Round((Get-Percentile $rtts 0.95),1) }
+  $jit_med = $null; if($jits.Count -gt 0){ $jit_med = [math]::Round((Get-Median $jits),1) }
+  $loss_avg= $null; if($loss.Count -gt 0){ $loss_avg = [math]::Round(($loss | Measure-Object -Average | Select-Object -ExpandProperty Average),2) }
+  $mos_med = $null; if($mosv.Count -gt 0){ $mos_med = [math]::Round((Get-Median $mosv),2) }
 
   $summaryRows += [PSCustomObject]@{
     area     = $g.Group[0].area
@@ -146,11 +173,11 @@ foreach($g in $groups){
     role     = $g.Group[0].role
     segment  = $g.Group[0].segment
     count    = $g.Count
-    rtt_med  = if($rtts.Count -gt 0){ [math]::Round((Get-Median $rtts),1) } else { $null }
-    rtt_p95  = if($rtts.Count -gt 0){ [math]::Round((Get-Percentile $rtts 0.95),1) } else { $null }
-    jit_med  = if($jits.Count -gt 0){ [math]::Round((Get-Median $jits),1) } else { $null }
-    loss_avg = if($loss.Count -gt 0){ [math]::Round(($loss | Measure-Object -Average | Select-Object -ExpandProperty Average),2) } else { $null }
-    mos_med  = if($mosv.Count -gt 0){ [math]::Round((Get-Median $mosv),2) } else { $null }
+    rtt_med  = $rtt_med
+    rtt_p95  = $rtt_p95
+    jit_med  = $jit_med
+    loss_avg = $loss_avg
+    mos_med  = $mos_med
   }
 }
 
@@ -195,12 +222,8 @@ $html = @"
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
     <select id="apSel"><option value="">(すべてのAP)</option></select>
     <input id="targetSearch" placeholder="対象(部分一致)" />
-    <select id="roleSel">
-      <option value="">(すべての役割)</option>
-    </select>
-    <select id="segSel">
-      <option value="">(すべてのセグメント)</option>
-    </select>
+    <select id="roleSel"><option value="">(すべての役割)</option></select>
+    <select id="segSel"><option value="">(すべてのセグメント)</option></select>
     <label class="chk"><input type="checkbox" id="includeExternal"> 外部(SaaS/Internet)を含める</label>
   </div>
 
@@ -235,9 +258,24 @@ $html = @"
   var summaryRows = $summaryJson;
 
   // ====== UI初期化 ======
-  function uniq(vals){ return Array.from(new Set(vals.filter(function(x){return !!x;}))).sort(); }
+  function uniq(vals){
+    var out = [];
+    for (var i=0;i<vals.length;i++){
+      var x = vals[i];
+      if (x) {
+        if (out.indexOf(x) === -1) { out.push(x); }
+      }
+    }
+    out.sort();
+    return out;
+  }
   function fillSel(el, opts){
-    opts.forEach(function(o){ var op = document.createElement('option'); op.textContent = o; op.value = o; el.appendChild(op); });
+    for (var i=0;i<opts.length;i++){
+      var op = document.createElement('option');
+      op.textContent = opts[i];
+      op.value = opts[i];
+      el.appendChild(op);
+    }
   }
   var areaSel = document.getElementById('areaSel');
   var apSel   = document.getElementById('apSel');
@@ -251,10 +289,12 @@ $html = @"
   fillSel(roleSel, uniq(summaryRows.map(function(r){return r.role;})));
   fillSel(segSel,  uniq(summaryRows.map(function(r){return r.segment;})));
 
-  [areaSel, apSel, roleSel, segSel, qInput, includeExternal].forEach(function(el){
+  function addInputHandler(el){
     el.addEventListener('input', render);
     el.addEventListener('change', render);
-  });
+  }
+  addInputHandler(areaSel); addInputHandler(apSel); addInputHandler(roleSel);
+  addInputHandler(segSel);  addInputHandler(qInput); addInputHandler(includeExternal);
 
   function colorRtt(td, val){
     if (val == null) return;
@@ -269,7 +309,9 @@ $html = @"
   function isExternalRole(role){
     if (!role) return false;
     var r = String(role).toLowerCase();
-    return (r === 'saas' || r === 'internet');
+    if (r === 'saas') return true;
+    if (r === 'internet') return true;
+    return false;
   }
 
   function render(){
@@ -283,24 +325,25 @@ $html = @"
     var tbody = document.querySelector('#sumTbl tbody');
     tbody.innerHTML = '';
 
-    // sort: area -> ap -> worst rtt_med desc
+    // sort: area -> ap -> worst rtt_med desc （三項演算子は使わない）
     var rows = summaryRows.slice().sort(function(a,b){
       var ka = (a.area||"") + "|" + (a.ap_name||"");
       var kb = (b.area||"") + "|" + (b.ap_name||"");
       if (ka < kb) return -1;
       if (ka > kb) return 1;
-      var ra = (a.rtt_med==null? -1 : -a.rtt_med);
-      var rb = (b.rtt_med==null? -1 : -b.rtt_med);
-      return (ra - rb);
+      var ra = -1; if (a.rtt_med != null) { ra = -a.rtt_med; }
+      var rb = -1; if (b.rtt_med != null) { rb = -b.rtt_med; }
+      return ra - rb;
     });
 
-    rows.forEach(function(r){
-      if (area && r.area !== area) return;
-      if (ap && (r.ap_name||"") !== ap) return;
-      if (role && r.role !== role) return;
-      if (seg && r.segment !== seg) return;
-      if (!showExt && isExternalRole(r.role)) return;
-      if (q && String(r.target).toLowerCase().indexOf(q) === -1) return;
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i];
+      if (area && r.area !== area) continue;
+      if (ap && (r.ap_name||"") !== ap) continue;
+      if (role && r.role !== role) continue;
+      if (seg && r.segment !== seg) continue;
+      if (!showExt && isExternalRole(r.role)) continue;
+      if (q && String(r.target).toLowerCase().indexOf(q) === -1) continue;
 
       var tr = document.createElement('tr');
       function td(t){ var e=document.createElement('td'); e.textContent = (t==null?"":t); return e; }
@@ -325,7 +368,7 @@ $html = @"
       tr.appendChild(td(r.mos_med));
 
       tbody.appendChild(tr);
-    });
+    }
   }
 
   // 既定で外部は除外
