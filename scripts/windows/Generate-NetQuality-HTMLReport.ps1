@@ -5,6 +5,7 @@
   - 出力: HTML 単一ファイル（外部ライブラリ不要）
   - 仕様: path_hop_quality.csv は解析しない（ZscalerによりInternet/SaaS向けpingは信頼しない想定）
   - 既定で SaaS / Internet は一覧から除外（HTML内のトグルで含め可能）
+  - エンコード: UTF-8 (BOM付き) で出力し文字化け防止
   - 注意: PowerShellの $Host は未使用。CSVの列名 host は target として扱う。
 
   使い方例:
@@ -64,6 +65,30 @@ function Safe-Lower {
   return ($s.ToString().Trim().ToLower())
 }
 
+function Normalize-Bssid {
+  param([string]$s)
+  if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+  $h = ($s -replace '[^0-9a-fA-F]', '').ToLower()
+  if ($h.Length -ge 12) { return $h.Substring(0,12) }
+  return $h
+}
+
+# floor.csv の bssid が接頭辞（例: aa:bb:cc:*）かを判定して正規化して返す
+function Get-FloorKey {
+  param([string]$raw)
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    return [PSCustomObject]@{ Key=$null; IsPrefix=$false }
+  }
+  $trimmed = $raw.Trim()
+  $isPrefix = $false
+  if ($trimmed.EndsWith("*")) {
+    $isPrefix = $true
+    $trimmed = $trimmed.Substring(0, $trimmed.Length - 1)
+  }
+  $norm = Normalize-Bssid $trimmed
+  return [PSCustomObject]@{ Key=$norm; IsPrefix=$isPrefix }
+}
+
 # ===== CSV 読み込み =====
 if (-not (Test-Path $QualityCsv)) { Write-Error "QualityCsv が見つかりません: $QualityCsv"; exit 1 }
 $qualRaw = Import-Csv -Path $QualityCsv
@@ -74,15 +99,62 @@ if (Test-Path $BssidFloorCsv) { $floorMap = Import-Csv -Path $BssidFloorCsv }
 $nodeRoles = @()
 if (Test-Path $NodeRoleCsv) { $nodeRoles = Import-Csv -Path $NodeRoleCsv }
 
-# BSSID→Area/Floor/Tag 辞書
-$areaByBssid  = @{}
-$floorByBssid = @{}
-$tagByBssid   = @{}
+# BSSID→Area/Floor/Tag の辞書（完全一致用）
+$areaByBssidExact  = @{}
+$floorByBssidExact = @{}
+$tagByBssidExact   = @{}
+# BSSID接頭辞用の配列（Key は正規化済み接頭辞）
+$prefixRows = @()  # 各要素: @{ Prefix="aabbcc"; Area="X"; Floor="Y"; Tag="Z" }
+
 foreach($r in $floorMap){
-  $b = Safe-Lower $r.bssid
-  if (-not $areaByBssid.ContainsKey($b))  { $areaByBssid[$b]  = $r.area }
-  if ($r.PSObject.Properties.Name -contains 'floor') { $floorByBssid[$b] = $r.floor }
-  if ($r.PSObject.Properties.Name -contains 'tag')   { $tagByBssid[$b]   = $r.tag }
+  $binfo = Get-FloorKey $r.bssid
+  $key = $binfo.Key
+  if ($null -eq $key) { continue }
+
+  $area = $r.area
+  $floor = $null
+  $tag = $null
+  if ($r.PSObject.Properties.Name -contains 'floor') { $floor = $r.floor }
+  if ($r.PSObject.Properties.Name -contains 'tag')   { $tag   = $r.tag }
+
+  if ($binfo.IsPrefix -or ($key.Length -lt 12)) {
+    $prefixRows += @{
+      Prefix = $key
+      Area   = $area
+      Floor  = $floor
+      Tag    = $tag
+    }
+  } else {
+    $areaByBssidExact[$key]  = $area
+    if ($null -ne $floor) { $floorByBssidExact[$key] = $floor }
+    if ($null -ne $tag)   { $tagByBssidExact[$key]   = $tag }
+  }
+}
+
+function Lookup-BssidMeta {
+  param([string]$bssidRaw)
+  $norm = Normalize-Bssid $bssidRaw
+  $area = "Unknown"; $floor=$null; $tag=$null
+
+  if ($null -ne $norm) {
+    if ($areaByBssidExact.ContainsKey($norm)) { $area = $areaByBssidExact[$norm] }
+    if ($floorByBssidExact.ContainsKey($norm)) { $floor = $floorByBssidExact[$norm] }
+    if ($tagByBssidExact.ContainsKey($norm))   { $tag   = $tagByBssidExact[$norm] }
+
+    if ($area -eq "Unknown" -and $prefixRows.Count -gt 0) {
+      foreach($p in $prefixRows){
+        $pref = $p.Prefix
+        if ($null -ne $pref -and $norm.StartsWith($pref)) {
+          $area = $p.Area
+          if ($null -ne $p.Floor) { $floor = $p.Floor }
+          if ($null -ne $p.Tag)   { $tag   = $p.Tag }
+          break
+        }
+      }
+    }
+  }
+
+  return [PSCustomObject]@{ Area=$area; Floor=$floor; Tag=$tag; Key=$norm }
 }
 
 # ノード（IP/FQDN）→役割/ラベル/セグメント
@@ -91,27 +163,19 @@ $labelByNode   = @{}
 $segmentByNode = @{}
 foreach($r in $nodeRoles){
   $k = Safe-Lower $r.ip_or_host
-  $roleByNode[$k] = $r.role
-  if ($r.PSObject.Properties.Name -contains 'label')   { $labelByNode[$k]   = $r.label }
-  if ($r.PSObject.Properties.Name -contains 'segment') { $segmentByNode[$k] = $r.segment }
+  if (-not [string]::IsNullOrWhiteSpace($k)) {
+    $roleByNode[$k] = $r.role
+    if ($r.PSObject.Properties.Name -contains 'label')   { $labelByNode[$k]   = $r.label }
+    if ($r.PSObject.Properties.Name -contains 'segment') { $segmentByNode[$k] = $r.segment }
+  }
 }
 
 # ===== 正規化（teams_net_quality）=====
 # 想定列: timestamp, host(対象), icmp_avg_ms, icmp_jitter_ms, loss_pct, mos, ssid, bssid, ap_name
 $qual = @()
 foreach($q in $qualRaw){
-  $bssidNorm = Safe-Lower $q.bssid
   $targetTxt = $q.host
-
-  # area/floor/tag を辞書から取得（PS5.1のため三項演算子は使わない）
-  $areaVal = "Unknown"
-  if ($areaByBssid.ContainsKey($bssidNorm)) { $areaVal = $areaByBssid[$bssidNorm] }
-
-  $floorVal = $null
-  if ($floorByBssid.ContainsKey($bssidNorm)) { $floorVal = $floorByBssid[$bssidNorm] }
-
-  $tagVal = $null
-  if ($tagByBssid.ContainsKey($bssidNorm)) { $tagVal = $tagByBssid[$bssidNorm] }
+  $meta = Lookup-BssidMeta $q.bssid
 
   $obj = [PSCustomObject]@{
     timestamp = $q.timestamp
@@ -121,19 +185,17 @@ foreach($q in $qualRaw){
     loss_pct  = Parse-Double $q.loss_pct
     mos       = Parse-Double $q.mos
     ssid      = $q.ssid
-    bssid     = $bssidNorm
+    bssid     = $meta.Key
     ap_name   = $q.ap_name
-    area      = $areaVal
-    floor     = $floorVal
-    ap_tag    = $tagVal
+    area      = $meta.Area
+    floor     = $meta.Floor
+    ap_tag    = $meta.Tag
   }
 
-  # MOS 未計算時は簡易推定
   if ($null -eq $obj.mos -and $null -ne $obj.rtt_ms -and $null -ne $obj.loss_pct) {
     $obj.mos = [math]::Round((4.5 - 0.0004*[double]$obj.rtt_ms - 0.1*[double]$obj.loss_pct),2)
   }
 
-  # 役割・ラベル・セグメント付与（三項演算子は使わず if で代入）
   $nk = Safe-Lower $obj.target
 
   $roleVal = "Uncategorized"
@@ -325,7 +387,7 @@ $html = @"
     var tbody = document.querySelector('#sumTbl tbody');
     tbody.innerHTML = '';
 
-    // sort: area -> ap -> worst rtt_med desc （三項演算子は使わない）
+    // sort: area -> ap -> worst rtt_med desc
     var rows = summaryRows.slice().sort(function(a,b){
       var ka = (a.area||"") + "|" + (a.ap_name||"");
       var kb = (b.area||"") + "|" + (b.ap_name||"");
@@ -379,6 +441,22 @@ $html = @"
 </html>
 "@
 
-# 出力
-$html | Out-File -FilePath $OutHtml -Encoding utf8
-Write-Output "HTMLレポートを出力しました: $OutHtml"
+# 出力 (UTF-8 BOM)
+try {
+  $enc = New-Object System.Text.UTF8Encoding($true) # BOM付き
+  $path = (Resolve-Path $OutHtml).Path
+  [System.IO.File]::WriteAllText($path, $html, $enc)
+  Write-Output "HTMLレポートを出力しました(UTF-8 BOM): $OutHtml"
+} catch {
+  # フォールバック
+  $html | Out-File -FilePath $OutHtml -Encoding utf8
+  Write-Warning "WriteAllText 失敗のため Out-File で出力しました。"
+}
+
+# 参考: マッピング状況の簡易サマリ（具体データは表示しません）
+$total = $qual.Count
+$mapped = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
+if ($total -gt 0) {
+  $pct = [math]::Round(100.0 * $mapped / $total, 1)
+  Write-Output ("BSSID→エリア マッピング率: {0}% ({1}/{2})" -f $pct,$mapped,$total)
+}
