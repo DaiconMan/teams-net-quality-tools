@@ -2,28 +2,17 @@
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
   - 入力CSV
     * teams_net_quality.csv（UTF-8 BOM）
-      必須ヘッダー: timestamp,target,hop_index,hop_ip,icmp_avg_ms,icmp_jitter_ms,loss_pct,ssid,bssid,ap_name,mos_estimate 他
-    * targets.csv（UTF-8） … ヘッダー: role,key,label  (key=FQDN or IP)
-      role: L2 / L3 / SAAS / RTR_WAN / RTR_LAN
+    * targets.csv（UTF-8） … ヘッダー: role,key,label
     * node_roles.csv（UTF-8, 任意） … ヘッダー: ip_of_host,role,label,segment
-    * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag
-  - 処理ポリシー
-    * 宛先判定は hop_ip を最優先 → 一致しなければ target（targets.key と一致した方だけ残す）
-    * area/floor/tag の付与は teams.bssid ↔ floors.bssid の突合せのみ（targets は無関係）
-  - 追加: 比較ログ出力（ファイル/コンソール）
-  - 出力: HTML 単一ファイル（UTF-8 BOM）
+    * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag,(任意で ap / ap_name)
+  - 仕様
+    * 宛先: hop_ip を最優先 → なければ target を targets.key と照合。一致しない行は除外
+    * area/floor/tag: teams.bssid ↔ floors.bssid の完全一致のみ（targets は無関与）
+    * AP表示: teams.ap_name → floors.(ap|ap_name) → BSSIDラベル の順で採用
+      - 集計は ap_key（通常はBSSIDの12桁hex / 無ければap_labelのLower）でグループ化、表示は ap_label
+    * ログ: -EnableCompareLog 時、行ごとにマッチ/エリア/BSSID/AP解決結果を上限行数まで記録
+  - 出力: HTML単一ファイル（UTF-8 BOM, 外部ライブラリ不要）
   - 注意: 三項演算子( ?: )不使用 / $Host未使用 / OneDrive・日本語パス対応
-
-  - 使い方
-  　powershell -NoProfile -ExecutionPolicy Bypass -File ".\Generate-NetQuality-HTMLReport.ps1" `
-　　　-QualityCsv ".\teams_net_quality.csv" `
-　　　-TargetsCsv ".\targets.csv" `
-　　　-FloorsCsv ".\floors.csv" `
-　　　-NodeRoleCsv ".\node_roles.csv" `
-　　　-OutHtml ".\out\NetQuality-Report.html" `
-　　　-EnableCompareLog `
-　　　-LogFile ".\out\NetQuality-MatchLog.txt" `
-　　　-MaxCompareLogLines 500
 #>
 
 [CmdletBinding()]
@@ -34,7 +23,7 @@ param(
   [string]$FloorsCsv = ".\floors.csv",
   [string]$OutHtml = ".\NetQuality-Report.html",
 
-  # 追加: ログ関連
+  # ログ関連
   [switch]$EnableCompareLog,
   [string]$LogFile = ".\NetQuality-MatchLog.txt",
   [int]$MaxCompareLogLines = 200
@@ -92,6 +81,22 @@ function Import-CsvUtf8 { param([string]$Path)
   return $lines | ConvertFrom-Csv
 }
 
+function Is-BlankOrUnknown { param([string]$s)
+  if ([string]::IsNullOrWhiteSpace($s)) { return $true }
+  $v = $s.Trim().ToLower()
+  if ($v -eq "unknown" -or $v -eq "(unknown)" -or $v -eq "n/a" -or $v -eq "-") { return $true }
+  return $false
+}
+
+function Format-BssidLabel { param([string]$hex12)
+  if ([string]::IsNullOrWhiteSpace($hex12)) { return "(AP unknown)" }
+  $h = ($hex12 -replace '[^0-9a-f]', '').ToLower()
+  if ($h.Length -lt 12) { return "BSSID:" + $h }
+  $parts = @()
+  for($i=0;$i -lt 12;$i+=2){ $parts += $h.Substring($i,2) }
+  return ("BSSID: " + ($parts -join ":"))
+}
+
 # ===== ロガー =====
 $script:LogWriter = $null
 $script:CompareLogLines = 0
@@ -131,7 +136,6 @@ function Log-Line {
   if (-not $EnableCompareLog) { return }
   if ($null -eq $script:LogWriter) { return }
   $script:LogWriter.WriteLine(("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $message))
-  # flushを過度に呼ばない
   $script:CompareLogLines++
   if (($script:CompareLogLines % 50) -eq 0) { $script:LogWriter.Flush() }
 }
@@ -177,10 +181,11 @@ foreach($r in $roles){
 }
 Log-Line ("node_rolesキー数: {0}" -f $roleByNode.Keys.Count)
 
-# floors.csv（BSSID完全一致）
+# floors.csv（BSSID完全一致 + 任意AP名）
 $areaByBssid  = @{}
 $floorByBssid = @{}
 $tagByBssid   = @{}
+$apByBssid    = @{}
 $dupFloors = 0
 foreach($f in $floors){
   $b = Normalize-Bssid $f.bssid
@@ -189,18 +194,29 @@ foreach($f in $floors){
   $areaByBssid[$b]  = $f.area
   if (-not [string]::IsNullOrWhiteSpace($f.floor)) { $floorByBssid[$b] = $f.floor }
   if (-not [string]::IsNullOrWhiteSpace($f.tag))   { $tagByBssid[$b]   = $f.tag }
+
+  # 任意: ap / ap_name 列を拾う
+  $apCandidate = $null
+  if ($f.PSObject.Properties.Name -contains 'ap') { $apCandidate = $f.ap }
+  if ($f.PSObject.Properties.Name -contains 'ap_name' -and [string]::IsNullOrWhiteSpace($apCandidate)) { $apCandidate = $f.ap_name }
+  if (-not (Is-BlankOrUnknown $apCandidate)) { $apByBssid[$b] = $apCandidate }
 }
-Log-Line ("floors辞書: areas={0} floors={1} tags={2} 重複={3}" -f $areaByBssid.Count,$floorByBssid.Count,$tagByBssid.Count,$dupFloors)
+Log-Line ("floors辞書: areas={0} floors={1} tags={2} apLabels={3} 重複={4}" -f $areaByBssid.Count,$floorByBssid.Count,$tagByBssid.Count,$apByBssid.Count,$dupFloors)
 
 # ===== 正規化 & マッチング（hop_ip を優先）=====
 $qual = @()
 $cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
-$emptyBssid = 0; $emptyAp = 0
 
 # BSSID比較の内訳
 $cntFloorHitExact = 0
 $cntFloorMissEmpty = 0
 $cntFloorMissNotFound = 0
+
+# AP解決の内訳
+$cntApFromTeams = 0
+$cntApFromFloors = 0
+$cntApFromBssid = 0
+$cntApUnknown = 0
 
 # 詳細ログ出力上限
 $lineBudget = $MaxCompareLogLines
@@ -236,15 +252,14 @@ foreach($q in $teams){
   # 役割/ラベルの補完（targetsに無い時だけ node_roles を見る）
   if ([string]::IsNullOrWhiteSpace($matchRole) -and $roleByNode.ContainsKey($matchKey))  { $matchRole  = $roleByNode[$matchKey] }
   if ([string]::IsNullOrWhiteSpace($matchLabel) -and $labelByNode.ContainsKey($matchKey)){ $matchLabel = $labelByNode[$matchKey] }
+  if ([string]::IsNullOrWhiteSpace($matchRole))  { $matchRole  = "Uncategorized" }
+  if ([string]::IsNullOrWhiteSpace($matchLabel)) { $matchLabel = $matchKey }
 
   # floors: BSSID → area/floor/tag
   $bNorm = Normalize-Bssid $q.bssid
-  $apName = $q.ap_name
   $areaVal = "Unknown"; $floorVal = $null; $tagVal = $null
   $bssidStatus = ""
-
   if ($null -eq $bNorm) {
-    $emptyBssid++
     $cntFloorMissEmpty++
     $bssidStatus = "bssid=EMPTY"
   } else {
@@ -260,7 +275,29 @@ foreach($q in $teams){
     }
   }
 
-  if ([string]::IsNullOrWhiteSpace($apName)) { $emptyAp++ }
+  # AP解決: teams.ap_name → floors.(ap/ap_name) → BSSIDラベル
+  $apFromTeams = $q.ap_name
+  $apFromFloors = $null
+  if ($null -ne $bNorm -and $apByBssid.ContainsKey($bNorm)) { $apFromFloors = $apByBssid[$bNorm] }
+
+  $apLabel = $null
+  if (-not (Is-BlankOrUnknown $apFromTeams)) {
+    $apLabel = $apFromTeams
+    $cntApFromTeams++
+  } elseif (-not (Is-BlankOrUnknown $apFromFloors)) {
+    $apLabel = $apFromFloors
+    $cntApFromFloors++
+  } elseif ($null -ne $bNorm) {
+    $apLabel = Format-BssidLabel $bNorm
+    $cntApFromBssid++
+  } else {
+    $apLabel = "(AP unknown)"
+    $cntApUnknown++
+  }
+
+  # ap_key は通常 BSSID（12桁hex）。無ければ apLabel の Lower を使用
+  $apKey = $null
+  if ($null -ne $bNorm) { $apKey = $bNorm } else { $apKey = Safe-Lower $apLabel }
 
   # 数値系
   $rtt  = Parse-Double $q.icmp_avg_ms
@@ -274,9 +311,8 @@ foreach($q in $teams){
   # ログ（行ごと、上限あり）
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     $lbssid = if ($null -eq $bNorm) { "(empty)" } else { $bNorm }
-    $lap = if ([string]::IsNullOrWhiteSpace($apName)) { "(empty)" } else { $apName }
     $mby = "hop" ; if ($matchKey -eq $tgtKey) { $mby = "target" }
-    Log-Line ("match={0} key={1} bssid={2} floors={3} area={4} ap={5}" -f $mby,$matchKey,$lbssid,$bssidStatus,$areaVal,$lap)
+    Log-Line ("match={0} key={1} bssid={2} floors={3} area={4} apLabel={5} apKey={6}" -f $mby,$matchKey,$lbssid,$bssidStatus,$areaVal,$apLabel,$apKey)
     $lineBudget = $lineBudget - 1
   }
 
@@ -290,7 +326,8 @@ foreach($q in $teams){
     mos       = $mos
     ssid      = $q.ssid
     bssid     = $bNorm
-    ap_name   = $apName
+    ap_key    = $apKey
+    ap_label  = $apLabel
     area      = $areaVal
     floor     = $floorVal
     ap_tag    = $tagVal
@@ -299,16 +336,12 @@ foreach($q in $teams){
     segment   = $segmentVal
   }
 
-  # role/label のデフォルト埋め
-  if ([string]::IsNullOrWhiteSpace($obj.role))  { $obj.role  = "Uncategorized" }
-  if ([string]::IsNullOrWhiteSpace($obj.label)) { $obj.label = $obj.target }
-
   $qual += $obj
 }
 
-# ===== 集計（エリア / AP / 対象 / 役割）=====
+# ===== 集計（エリア / APキー / 対象 / 役割）=====
 $summaryRows = @()
-$groups = $qual | Group-Object -Property area, ap_name, target, role, segment
+$groups = $qual | Group-Object -Property area, ap_key, target, role, segment
 foreach($g in $groups){
   $rtts = @($g.Group | Where-Object {$_.rtt_ms -ne $null}    | ForEach-Object {[double]$_.rtt_ms})
   $jits = @($g.Group | Where-Object {$_.jitter_ms -ne $null} | ForEach-Object {[double]$_.jitter_ms})
@@ -321,12 +354,14 @@ foreach($g in $groups){
   $loss_avg= $null; if($loss.Count -gt 0){ $loss_avg = [math]::Round(($loss | Measure-Object -Average | Select-Object -ExpandProperty Average),2) }
   $mos_med = $null; if($mosv.Count -gt 0){ $mos_med = [math]::Round((Get-Median $mosv),2) }
 
+  $first = $g.Group[0]
   $summaryRows += [PSCustomObject]@{
-    area     = $g.Group[0].area
-    ap_name  = $g.Group[0].ap_name
-    target   = $g.Group[0].target
-    role     = $g.Group[0].role
-    segment  = $g.Group[0].segment
+    area     = $first.area
+    ap_key   = $first.ap_key
+    ap_label = $first.ap_label
+    target   = $first.target
+    role     = $first.role
+    segment  = $first.segment
     count    = $g.Count
     rtt_med  = $rtt_med
     rtt_p95  = $rtt_p95
@@ -357,7 +392,7 @@ $htmlTemplate = @'
   .rt-ok{background:#e7f7e7;} .rt-warn{background:#fff5e0;} .rt-bad{background:#fdecec;} .loss-bad{background:#fdecec;}
 </style>
 </head><body>
-  <h1>ネットワーク品質レポート（targets.csv × hop_ip優先照合）</h1>
+  <h1>ネットワーク品質レポート（targets.csv × hop_ip優先照合／AP解決強化）</h1>
 
   <div class="filters">
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
@@ -379,11 +414,18 @@ var summaryRows = __SUMMARY_JSON__;
 
 function uniq(a){var o=[],i;for(i=0;i<a.length;i++){var x=a[i];if(x&&o.indexOf(x)===-1)o.push(x);}o.sort();return o;}
 function fillSel(el,opts){for(var i=0;i<opts.length;i++){var op=document.createElement('option');op.textContent=opts[i];op.value=opts[i];el.appendChild(op);}}
-var areaSel=document.getElementById('areaSel'),apSel=document.getElementById('apSel'),roleSel=document.getElementById('roleSel'),segSel=document.getElementById('segSel'),qInput=document.getElementById('targetSearch');
+
+var areaSel=document.getElementById('areaSel'),
+    apSel=document.getElementById('apSel'),
+    roleSel=document.getElementById('roleSel'),
+    segSel=document.getElementById('segSel'),
+    qInput=document.getElementById('targetSearch');
+
 fillSel(areaSel,uniq(summaryRows.map(function(r){return r.area;})));
-fillSel(apSel,uniq(summaryRows.map(function(r){return r.ap_name;}).filter(function(x){return !!x;})));
+fillSel(apSel,uniq(summaryRows.map(function(r){return r.ap_label;}).filter(function(x){return !!x;})));
 fillSel(roleSel,uniq(summaryRows.map(function(r){return r.role;})));
 fillSel(segSel,uniq(summaryRows.map(function(r){return r.segment;})));
+
 [areaSel,apSel,roleSel,segSel,qInput].forEach(function(el){el.addEventListener('input',render);el.addEventListener('change',render);});
 
 function colorRtt(td,v){if(v==null)return;if(v<50)td.classList.add('rt-ok');else if(v<100)td.classList.add('rt-warn');else td.classList.add('rt-bad');}
@@ -392,14 +434,16 @@ function colorLoss(td,v){if(v!=null&&v>3)td.classList.add('loss-bad');}
 function render(){
   var area=areaSel.value||"",ap=apSel.value||"",role=roleSel.value||"",seg=segSel.value||"",q=(qInput.value||"").toLowerCase();
   var tbody=document.querySelector('#sumTbl tbody'); tbody.innerHTML='';
+
   var rows=summaryRows.slice().sort(function(a,b){
-    var ka=(a.area||"")+"|"+(a.ap_name||""); var kb=(b.area||"")+"|"+(b.ap_name||"");
+    var ka=(a.area||"")+"|"+(a.ap_label||""); var kb=(b.area||"")+"|"+(b.ap_label||"");
     if(ka<kb)return-1;if(ka>kb)return 1; var ra=-1;if(a.rtt_med!=null)ra=-a.rtt_med; var rb=-1;if(b.rtt_med!=null)rb=-b.rtt_med; return ra-rb;
   });
+
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
     if(area && r.area!==area)continue;
-    if(ap && (r.ap_name||"")!==ap)continue;
+    if(ap && (r.ap_label||"")!==ap)continue;
     if(role && r.role!==role)continue;
     if(seg && r.segment!==seg)continue;
     if(q && String(r.target||"").toLowerCase().indexOf(q)===-1)continue;
@@ -408,7 +452,7 @@ function render(){
     function td(t){var e=document.createElement('td'); e.textContent=(t==null?"":t); return e;}
 
     tr.appendChild(td(r.area));
-    tr.appendChild(td(r.ap_name||""));
+    tr.appendChild(td(r.ap_label||""));
 
     var ttd=td(r.target); ttd.classList.add('mono'); tr.appendChild(ttd);
 
@@ -455,8 +499,9 @@ if ($total -gt 0) {
   $pctUsed = [math]::Round(100.0 * $after / $total, 1)
   $pctArea = 0.0
   if ($after -gt 0) { $pctArea = [math]::Round(100.0 * $mappedArea / $after, 1) }
-  $summary = ("teams行数: {0}, 採用行数( targets×(hop_ip→target) ): {1} ({2}%) | area付与率: {3}% ({4}/{5}) | hop一致: {6} / target一致: {7} / 除外: {8} | bssid空欄: {9} / ap_name空欄: {10} | floors: HIT={11} / EMPTY={12} / NOTFOUND={13}" -f `
-    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntMatchHop,$cntMatchTarget,$cntDropped,$emptyBssid,$emptyAp,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound)
+
+  $summary = ("teams行数: {0}, 採用行数( targets×(hop_ip→target) ): {1} ({2}%) | area付与率: {3}% ({4}/{5}) | hop一致: {6} / target一致: {7} / 除外: {8} | floors: HIT={9} / EMPTY={10} / NOTFOUND={11} | AP解決: teams={12} floors={13} bssid={14} unknown={15}" -f `
+    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntMatchHop,$cntMatchTarget,$cntDropped,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound,$cntApFromTeams,$cntApFromFloors,$cntApFromBssid,$cntApUnknown)
   Write-Output $summary
   Log-Line $summary
 }
