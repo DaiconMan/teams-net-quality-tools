@@ -5,18 +5,18 @@ chcp 932 >nul 2>&1
 rem ===================== 設定 =====================
 set "SCRIPT=Merge-TeamsNet-CSV.ps1"
 
-rem セミコロン(;)区切りで“ディレクトリ”を列挙
+rem セミコロン(;)区切りで“ディレクトリ”を列挙してください（スペース/日本語OK）
 rem 例: set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
-rem 例: set "FOLDERS=.\部署A\8F 東;.\部署B\10F 西"
 set "FOLDERS=.\Logs\8F-A;.\Logs\10F-B"
 
-rem タグ（; 区切り）。空なら各ディレクトリの末端名を自動採用
+rem タグ（; 区切り）。空なら各ディレクトリの末端名を自動採用します
+rem 例: set "TAGS=8F-A;10F-B"
 set "TAGS="
 
 rem 1=サブフォルダも再帰、0=直下のみ
 set "RECURSE=1"
 
-rem 単一ファイル出力先
+rem 単一ファイル出力
 set "OUTPUT=.\merged_teams_net_quality.csv"
 
 rem ====== 日別分割（使う場合）======
@@ -29,7 +29,7 @@ rem ================ ここから処理 ================
 set "UNIT_LIST="
 set "TAG_LIST="
 
-rem セミコロン分割を安全に処理
+rem -- セミコロン分割を安全に処理 --
 set "REST=%FOLDERS%"
 :__split_loop
 if not defined REST goto __split_done
@@ -52,32 +52,19 @@ if "%UNIT_LIST%"=="" (
   exit /b 1
 )
 
-rem RECURSE=1/0 を PS の switch 引数に変換
-set "PS_RECURSE_ARG="
-if "%RECURSE%"=="1" (
-  set "PS_RECURSE_ARG=-Recurse:$true"
-) else (
-  set "PS_RECURSE_ARG=-Recurse:$false"
-)
-
-rem PowerShell 実行
+rem ---- PowerShell コマンドを安全に組み立て（可変引数を行末に置かない）----
+set "PSCMD=powershell -NoProfile -ExecutionPolicy Bypass -File ""%SCRIPT%"" -InputCsvs ""%UNIT_LIST%"" -Tags ""%TAG_LIST%"""
 if "%SPLIT_BY_DATE%"=="1" (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" ^
-    -InputCsvs "%UNIT_LIST%" ^
-    -Tags "%TAG_LIST%" ^
-    -SplitByDate ^
-    -DateColumn "%DATE_COLUMN%" ^
-    -DateFormat "%DATE_FORMAT%" ^
-    -OutputDir "%OUTPUT_DIR%" ^
-    %PS_RECURSE_ARG%
+  set "PSCMD=!PSCMD! -SplitByDate -DateColumn ""%DATE_COLUMN%"" -DateFormat ""%DATE_FORMAT%"" -OutputDir ""%OUTPUT_DIR%"""
 ) else (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" ^
-    -InputCsvs "%UNIT_LIST%" ^
-    -Tags "%TAG_LIST%" ^
-    -Output "%OUTPUT%" ^
-    %PS_RECURSE_ARG%
+  set "PSCMD=!PSCMD! -Output ""%OUTPUT%"""
+)
+if "%RECURSE%"=="1" (
+  set "PSCMD=!PSCMD! -Recurse"
 )
 
+rem 実行（行継続 ^ を使わず、そのまま実行）
+%PSCMD%
 exit /b !ERRORLEVEL!
 
 :__append_dir
