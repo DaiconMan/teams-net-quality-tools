@@ -13,7 +13,10 @@
 
 .PARAMETER TargetColumn
   Target 列の明示指定（既定: 自動検出: target|host|hostname|dst|endpoint|server）
-  ※互換のため -HostColumn エイリアスも受理します（内部では使いません）
+  ※CSVの列名に "host" が含まれていても、PowerShell予約変数 $Host とは無関係です（内部変数名は Target 系に統一）
+
+.PARAMETER HostColumn
+  互換用の別名パラメータ（指定時は TargetColumn より劣後）。内部では Target として扱います。
 
 .PARAMETER LatencyColumn
   レイテンシ列の明示指定（既定: 自動検出: rtt_ms|rtt|latency_ms|latency|avg_ms|response_ms）
@@ -39,8 +42,9 @@ param(
 
   [string]$TagColumn,
 
-  [Alias('HostColumn')]
   [string]$TargetColumn,
+
+  [string]$HostColumn,
 
   [string]$LatencyColumn,
 
@@ -64,7 +68,8 @@ function Find-FirstPresentColumn($Headers, [string[]]$Candidates){
 
 function Detect-Columns($Headers){
   # 小文字でそろえる
-  $h = @($Headers | ForEach-Object { ($_ -as [string]).ToLowerInvariant() })
+  $h = @()
+  foreach($x in $Headers){ $h += ($x -as [string]).ToLowerInvariant() }
 
   $tag = Find-FirstPresentColumn $h @('probe','tag','location')
   $tgt = Find-FirstPresentColumn $h @('target','host','hostname','dst','endpoint','server')
@@ -75,7 +80,8 @@ function Detect-Columns($Headers){
 
 function Percentile([double[]]$values, [double]$p){
   if(-not $values -or $values.Count -eq 0){ return $null }
-  $arr = @($values | Sort-Object)
+  $arr = @($values)
+  [Array]::Sort($arr)
   $n = $arr.Count
   if($n -eq 1){ return $arr[0] }
   $rank = [math]::Ceiling($p * $n)
@@ -84,7 +90,7 @@ function Percentile([double[]]$values, [double]$p){
 }
 
 function Ensure-Dir($path){
-  if(-not (Test-Path -LiteralPath $path)){ New-Item -ItemType Directory -Path $path | Out-Null }
+  if(-not (Test-Path -LiteralPath $path)){ $null = New-Item -ItemType Directory -Path $path }
 }
 
 function Sanitize-WorksheetName([string]$name){
@@ -103,12 +109,14 @@ try{
   if(-not $rows){ throw "CSV rows are empty." }
 
   # ヘッダ取得（小文字化）
-  $headersLower = @($rows[0].PSObject.Properties.Name | ForEach-Object { ($_ -as [string]).ToLowerInvariant() })
+  $headersLower = @()
+  foreach($hn in $rows[0].PSObject.Properties.Name){ $headersLower += ($hn -as [string]).ToLowerInvariant() }
 
   # 列自動検出または指定優先
   $det = Detect-Columns $headersLower
   $tagCol = if($TagColumn){ $TagColumn } else { $det.Tag }
-  $tgtCol = if($TargetColumn){ $TargetColumn } else { $det.Target }
+  # TargetColumn が優先。無ければ HostColumn を利用。それも無ければ自動検出。
+  $tgtCol = if($TargetColumn){ $TargetColumn } elseif($HostColumn){ $HostColumn } else { $det.Target }
   $latCol = if($LatencyColumn){ $LatencyColumn } else { $det.Latency }
 
   if(-not $tagCol){ throw "Tag 列が見つかりません。-TagColumn で指定するか、CSV に probe|tag|location のいずれかの列を含めてください。" }
@@ -116,43 +124,68 @@ try{
 
   Write-Info ("Using columns -> Tag:'{0}', Target:'{1}', Latency:'{2}'" -f $tagCol,$tgtCol,$latCol)
 
-  # 正規化して投影
-  $proj = foreach($r in $rows){
+  # 正規化して投影（パイプ未使用）
+  $proj = @()
+  foreach($r in $rows){
     $tag = ($r.$tagCol) -as [string]
     $tgt = if($tgtCol){ ($r.$tgtCol) -as [string] } else { $null }
 
     # 数値化（'123ms' 形式にも一部対応）
     $raw = ($r.$latCol) -as [string]
-    if($raw -match '([-+]?\d+(\.\d+)?)'){ $lat = [double]$matches[1] } else { $lat = $null }
+    $lat = $null
+    if($raw -and ($raw -match '([-+]?\d+(\.\d+)?)')){ $lat = [double]$matches[1] }
 
-    [pscustomobject]@{
-      Tag = $tag
-      Target = if($tgt){ $tgt } else { "_(all)" }
-      LatencyMs = $lat
+    if($lat -ne $null){
+      $proj += [pscustomobject]@{
+        Tag = $tag
+        Target = if($tgt){ $tgt } else { "_(all)" }
+        LatencyMs = $lat
+      }
     }
   }
 
-  # 欠損除外
-  $proj = $proj | Where-Object { $_.LatencyMs -ne $null }
-  if(-not $proj){ throw "有効なレイテンシ行がありません（数値に変換できませんでした）。" }
+  if(-not $proj -or $proj.Count -eq 0){ throw "有効なレイテンシ行がありません（数値に変換できませんでした）。" }
 
-  # 集計（Tag, Target）
-  Write-Info "Aggregating by Tag/Target..."
-  $grouped = $proj | Group-Object Tag, Target
+  # 手動グルーピング（Tag, Target）※パイプ未使用
+  $dict = @{}
+  foreach($p in $proj){
+    $tagKey = if([string]::IsNullOrWhiteSpace($p.Tag)){"_(blank)"}else{$p.Tag}
+    $key = "$tagKey`t$($p.Target)"
+    if(-not $dict.ContainsKey($key)){
+      $dict[$key] = [pscustomobject]@{
+        Tag = $tagKey
+        Target = $p.Target
+        Values = @()
+      }
+    }
+    $vals = @($dict[$key].Values)
+    $vals += $p.LatencyMs
+    $dict[$key].Values = $vals
+  }
 
-  $outRows = foreach($g in $grouped){
-    $tag = $g.Group[0].Tag
-    $tgt = $g.Group[0].Target
-    $vals = @($g.Group | ForEach-Object { $_.LatencyMs })
+  # 集計
+  $outRows = @()
+  foreach($kv in $dict.GetEnumerator()){
+    $rec = $kv.Value
+    $vals = @($rec.Values)
     $n = $vals.Count
-    $avg = [math]::Round(($vals | Measure-Object -Average).Average, 1)
+
+    # 平均
+    $sum = 0.0
+    foreach($v in $vals){ $sum += [double]$v }
+    $avg = if($n -gt 0){ [math]::Round($sum / $n, 1) } else { $null }
+
+    # P95
     $p95 = [math]::Round((Percentile $vals 0.95), 1)
-    $over = @($vals | Where-Object { $_ -ge $ThresholdMs }).Count
+
+    # 閾値超え
+    $over = 0
+    foreach($v in $vals){ if($v -ge $ThresholdMs){ $over++ } }
     $overPct = if($n -gt 0){ [math]::Round(100.0 * $over / $n, 1) } else { $null }
 
-    [pscustomobject]@{
-      Tag = if([string]::IsNullOrWhiteSpace($tag)){"_(blank)"}else{$tag}
-      Target = $tgt
+    $outRows += [pscustomobject]@{
+      Tag = $rec.Tag
+      Target = $rec.Target
       Samples = $n
       AvgMs = $avg
       P95Ms = $p95
@@ -160,12 +193,44 @@ try{
       OverThresholdPct = $overPct
       ThresholdMs = $ThresholdMs
     }
-  } | Sort-Object Tag, Target
+  }
 
-  # CSV 出力
+  # 並び替え（安定のため、簡易バブル/比較で並べ替え）
+  # PowerShell 5.1 でも Sort-Object は安全ですが、パイプ無しで実装
+  $sorted = @($outRows)
+  for($i=0; $i -lt $sorted.Count; $i++){
+    for($j=$i+1; $j -lt $sorted.Count; $j++){
+      $a = $sorted[$i]; $b = $sorted[$j]
+      $cmpTag = [string]::Compare(($a.Tag), ($b.Tag))
+      $swap = $false
+      if($cmpTag -gt 0){ $swap = $true }
+      elseif($cmpTag -eq 0){
+        if([string]::Compare(($a.Target), ($b.Target)) -gt 0){ $swap = $true }
+      }
+      if($swap){
+        $tmp = $sorted[$i]; $sorted[$i] = $sorted[$j]; $sorted[$j] = $tmp
+      }
+    }
+  }
+
+  # CSV 出力（パイプ未使用）
   $csvOut = Join-Path $Output "TagSummary.csv"
   Write-Info "Writing CSV: $csvOut"
-  $outRows | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $csvOut
+  $lines = @()
+  # ヘッダ
+  $lines += '"Tag","Target","Samples","AvgMs","P95Ms","OverThresholdCount","OverThresholdPct","ThresholdMs"'
+  foreach($r in $sorted){
+    $line = '"' + ($r.Tag -replace '"','""') + '","' +
+                  ($r.Target -replace '"','""') + '",' +
+                  $r.Samples + ',' +
+                  $r.AvgMs + ',' +
+                  $r.P95Ms + ',' +
+                  $r.OverThresholdCount + ',' +
+                  $r.OverThresholdPct + ',' +
+                  $r.ThresholdMs
+    $lines += $line
+  }
+  [System.IO.File]::WriteAllLines($csvOut, $lines, (New-Object System.Text.UTF8Encoding($false)))
 
   # Excel 出力（Office 環境のみ）
   $xlsxOut = Join-Path $Output "TagSummary.xlsx"
@@ -188,7 +253,7 @@ try{
         $ws.Cells.Item(1, $i+1) = $headers[$i]
       }
       $row = 2
-      foreach($r in $outRows){
+      foreach($r in $sorted){
         $ws.Cells.Item($row,1) = $r.Tag
         $ws.Cells.Item($row,2) = $r.Target
         $ws.Cells.Item($row,3) = $r.Samples
@@ -200,9 +265,13 @@ try{
         $row++
       }
       # Tag ごとに別シート
-      $byTag = $outRows | Group-Object Tag
-      foreach($tg in $byTag){
-        $name = Sanitize-WorksheetName $tg.Name
+      $byTag = @{}
+      foreach($r in $sorted){
+        if(-not $byTag.ContainsKey($r.Tag)){ $byTag[$r.Tag] = @() }
+        $byTag[$r.Tag] += $r
+      }
+      foreach($kv2 in $byTag.GetEnumerator()){
+        $name = Sanitize-WorksheetName $kv2.Key
         $sheet = $wb.Worksheets.Add()
         $null = $sheet.Move($ws)   # 先頭へ
         $sheet.Name = $name
@@ -210,7 +279,16 @@ try{
           $sheet.Cells.Item(1, $i+1) = $headers[$i]
         }
         $ridx = 2
-        foreach($r in ($tg.Group | Sort-Object Target)){
+        # Target の昇順で並べる
+        $grpSorted = @($kv2.Value)
+        for($i=0; $i -lt $grpSorted.Count; $i++){
+          for($j=$i+1; $j -lt $grpSorted.Count; $j++){
+            if([string]::Compare($grpSorted[$i].Target, $grpSorted[$j].Target) -gt 0){
+              $tmp2 = $grpSorted[$i]; $grpSorted[$i] = $grpSorted[$j]; $grpSorted[$j] = $tmp2
+            }
+          }
+        }
+        foreach($r in $grpSorted){
           $sheet.Cells.Item($ridx,1) = $r.Tag
           $sheet.Cells.Item($ridx,2) = $r.Target
           $sheet.Cells.Item($ridx,3) = $r.Samples
@@ -223,8 +301,9 @@ try{
         }
       }
 
-      # 体裁
-      for($i=1; $i -le $wb.Worksheets.Count; $i++){
+      # 体裁（見出し太字＋オートフィット）
+      $sheetCount = $wb.Worksheets.Count
+      for($i=1; $i -le $sheetCount; $i++){
         $s = $wb.Worksheets.Item($i)
         $s.Rows.Item(1).Font.Bold = $true
         $null = $s.Columns.AutoFit()
@@ -234,7 +313,7 @@ try{
       $wb.SaveAs($xlsxOut)
       $wb.Close($true)
     }finally{
-      $excel.Quit() | Out-Null
+      $null = $excel.Quit()
       [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel)
     }
   }
