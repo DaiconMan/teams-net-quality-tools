@@ -2,24 +2,27 @@
 .SYNOPSIS
   Tag(=測定場所)ごとの品質サマリを作成し、Excel/CSVで出力する（PowerShell 5.1対応）
 
+.DESCRIPTION
+  Run-Merge-TeamsNet-CSV.bat の出力（例: rtt_ms_gateway, rtt_ms_hop2, ... の横持ち）にも整合。
+  レイテンシ候補列を自動検出し、必要に応じてロング化（列名から Target を推定）して集計。
+
 .PARAMETER CsvPath
-  マージ済みの入力CSVパス（tags/probe列を含む想定）
+  マージ済み入力CSV（Run-Merge-TeamsNet-CSV.bat の出力を想定）
 
 .PARAMETER Output
   出力フォルダ（既定: .\Output）
 
 .PARAMETER TagColumn
-  Tag 列の明示指定（既定: 自動検出: probe|tag|location）
+  Tag 列の明示（既定: 自動検出: probe|tag|location|site|place）
 
 .PARAMETER TargetColumn
-  Target 列の明示指定（既定: 自動検出: target|host|hostname|dst|endpoint|server）
-  ※CSVの列名に "host" が含まれていても、PowerShell予約変数 $Host とは無関係です（内部変数名は Target 系に統一）
+  1列レイテンシ時の Target 列（既定: 自動検出: target|hostname|endpoint|server|dst|fqdn|ip|addr）
 
 .PARAMETER HostColumn
-  互換用の別名パラメータ（指定時は TargetColumn より劣後）。内部では Target として扱います。
+  互換のため受け付け（内部では Target として扱う。TargetColumn が優先）
 
 .PARAMETER LatencyColumn
-  レイテンシ列の明示指定（既定: 自動検出: rtt_ms|rtt|latency_ms|latency|avg_ms|response_ms）
+  レイテンシ列の明示（既定: 自動検出。ワイド時は無視されず、その列だけ使う）
 
 .PARAMETER ThresholdMs
   遅延のしきい値（既定: 100）
@@ -28,9 +31,9 @@
   Output\TagSummary.xlsx, Output\TagSummary.csv
 
 .NOTES
-  - Excel COM を使用（Office がない環境では CSV のみ出力）
-  - 列名は大小区別せず照合
-  - PowerShell 5.1 互換
+  - $Host などの予約語は未使用
+  - パイプは必要最小限（空パイプ要素回避）
+  - Excel COM が無い環境では CSV のみ出力
 #>
 
 [CmdletBinding()]
@@ -54,28 +57,90 @@ param(
 function Write-Info($msg){ Write-Host "[TagSummary] $msg" }
 
 function Test-File([string]$Path){
-  if(-not (Test-Path -LiteralPath $Path)){
-    throw "File not found: $Path"
-  }
+  if(-not (Test-Path -LiteralPath $Path)){ throw "File not found: $Path" }
 }
 
-function Find-FirstPresentColumn($Headers, [string[]]$Candidates){
-  foreach($c in $Candidates){
-    if($Headers -contains $c){ return $c }
-  }
+function Ensure-Dir($path){
+  if(-not (Test-Path -LiteralPath $path)){ $null = New-Item -ItemType Directory -Path $path }
+}
+
+function ToLowerArray($arr){
+  $out = @()
+  foreach($x in $arr){ $out += ($x -as [string]).ToLowerInvariant() }
+  return $out
+}
+
+function Detect-TagColumn($headersLower){
+  $cands = @('probe','tag','location','site','place')
+  foreach($c in $cands){ if($headersLower -contains $c){ return $c } }
   return $null
 }
 
-function Detect-Columns($Headers){
-  # 小文字でそろえる
-  $h = @()
-  foreach($x in $Headers){ $h += ($x -as [string]).ToLowerInvariant() }
+function Detect-TargetColumn($headersLower){
+  $cands = @('target','hostname','endpoint','server','dst','fqdn','ip','addr')
+  foreach($c in $cands){ if($headersLower -contains $c){ return $c } }
+  return $null
+}
 
-  $tag = Find-FirstPresentColumn $h @('probe','tag','location')
-  $tgt = Find-FirstPresentColumn $h @('target','host','hostname','dst','endpoint','server')
-  $lat = Find-FirstPresentColumn $h @('rtt_ms','rtt','latency_ms','latency','avg_ms','response_ms')
+function Get-LatencyCandidates($headersOrig, $headersLower, $forced){
+  # 明示指定があればその1列のみ
+  if($forced){
+    $idx = -1
+    for($i=0;$i -lt $headersOrig.Count;$i++){
+      if($headersOrig[$i] -eq $forced){ $idx = $i; break }
+      if($headersLower[$i] -eq $forced.ToLowerInvariant()){ $idx = $i; break }
+    }
+    if($idx -ge 0){
+      return @(@{ Name=$headersOrig[$idx]; Lower=$headersLower[$idx]; Suffix=''; })
+    }
+  }
 
-  @{ Tag=$tag; Target=$tgt; Latency=$lat }
+  $tokens = @('rtt','latency','ping','response','delay','roundtrip','elapsed','time','avg')
+  $cands = @()
+  for($i=0;$i -lt $headersLower.Count;$i++){
+    $h = $headersLower[$i]
+    $matched = $false
+    foreach($t in $tokens){
+      if($h.IndexOf($t) -ge 0){ $matched = $true; break }
+    }
+    if(-not $matched){ continue }
+
+    # 列名から Target 推定（接頭辞/接尾辞除去）
+    $suffix = $h
+    foreach($t in $tokens){ $suffix = $suffix.Replace($t,'') }
+    $suffix = $suffix.Replace('_ms','').Replace('-ms','').Replace('ms','')
+    # 記号 -> スペース -> Trim -> アンダースコア区切りで最後尾を採用
+    $clean = [System.Text.RegularExpressions.Regex]::Replace($suffix, '[^a-z0-9]+', '_')
+    $clean = $clean.Trim('_')
+    $suffixGuess = ''
+    if($clean -ne ''){
+      $parts = $clean.Split('_')
+      $suffixGuess = $parts[$parts.Length-1]
+      if($suffixGuess -eq ''){ $suffixGuess = $clean }
+    }
+
+    # 代表的なロール名正規化（gateway/gw/hop2 等）
+    if($suffixGuess -eq ''){ $suffixGuess = '' }
+    elseif($suffixGuess -eq 'gw'){ $suffixGuess = 'gateway' }
+
+    $cands += @{ Name=$headersOrig[$i]; Lower=$h; Suffix=$suffixGuess; }
+  }
+
+  return $cands
+}
+
+function Parse-DoubleOrNull([string]$s){
+  if(-not $s){ return $null }
+  $m = [System.Text.RegularExpressions.Regex]::Match($s, '[-+]?\d+(\.\d+)?')
+  if($m.Success){ return [double]$m.Value }
+  return $null
+}
+
+function Sanitize-WorksheetName([string]$name){
+  if([string]::IsNullOrWhiteSpace($name)){ return "_(blank)" }
+  $n = $name -replace '[\\\/\?\*\[\]:]', '_'
+  if($n.Length -gt 31){ return $n.Substring(0,31) }
+  return $n
 }
 
 function Percentile([double[]]$values, [double]$p){
@@ -89,17 +154,6 @@ function Percentile([double[]]$values, [double]$p){
   return $arr[$idx]
 }
 
-function Ensure-Dir($path){
-  if(-not (Test-Path -LiteralPath $path)){ $null = New-Item -ItemType Directory -Path $path }
-}
-
-function Sanitize-WorksheetName([string]$name){
-  if([string]::IsNullOrWhiteSpace($name)){ return "_(blank)" }
-  $n = $name -replace '[\\\/\?\*\[\]:]', '_'
-  if($n.Length -gt 31){ return $n.Substring(0,31) }
-  return $n
-}
-
 try{
   Test-File $CsvPath
   Ensure-Dir $Output
@@ -108,52 +162,75 @@ try{
   $rows = Import-Csv -LiteralPath $CsvPath
   if(-not $rows){ throw "CSV rows are empty." }
 
-  # ヘッダ取得（小文字化）
-  $headersLower = @()
-  foreach($hn in $rows[0].PSObject.Properties.Name){ $headersLower += ($hn -as [string]).ToLowerInvariant() }
+  # ヘッダ
+  $headersOrig = @($rows[0].PSObject.Properties.Name)
+  $headersLower = ToLowerArray $headersOrig
 
-  # 列自動検出または指定優先
-  $det = Detect-Columns $headersLower
-  $tagCol = if($TagColumn){ $TagColumn } else { $det.Tag }
-  # TargetColumn が優先。無ければ HostColumn を利用。それも無ければ自動検出。
-  $tgtCol = if($TargetColumn){ $TargetColumn } elseif($HostColumn){ $HostColumn } else { $det.Target }
-  $latCol = if($LatencyColumn){ $LatencyColumn } else { $det.Latency }
+  # 列名の自動検出
+  $tagColLower = if($TagColumn){ $TagColumn.ToLowerInvariant() } else { Detect-TagColumn $headersLower }
+  $tgtColLower = $null
+  if($TargetColumn){ $tgtColLower = $TargetColumn.ToLowerInvariant() }
+  elseif($HostColumn){ $tgtColLower = $HostColumn.ToLowerInvariant() }
+  else { $tgtColLower = Detect-TargetColumn $headersLower }
 
-  if(-not $tagCol){ throw "Tag 列が見つかりません。-TagColumn で指定するか、CSV に probe|tag|location のいずれかの列を含めてください。" }
-  if(-not $latCol){ throw "レイテンシ列が見つかりません。-LatencyColumn で指定するか、CSV に rtt_ms|rtt|latency_ms|latency|avg_ms|response_ms のいずれかの列を含めてください。" }
+  # 実ヘッダ名（大文字小文字原型）へ引き直し
+  $tagCol = $null; $tgtCol = $null
+  for($i=0;$i -lt $headersOrig.Count;$i++){
+    if($headersLower[$i] -eq $tagColLower){ $tagCol = $headersOrig[$i] }
+    if($tgtColLower -and $headersLower[$i] -eq $tgtColLower){ $tgtCol = $headersOrig[$i] }
+  }
 
-  Write-Info ("Using columns -> Tag:'{0}', Target:'{1}', Latency:'{2}'" -f $tagCol,$tgtCol,$latCol)
+  # レイテンシ候補列の収集
+  $latCands = Get-LatencyCandidates $headersOrig $headersLower $LatencyColumn
+  if(-not $latCands -or $latCands.Count -eq 0){
+    throw "レイテンシ列が見つかりません。列名に rtt/latency/ping/response/delay/roundtrip/elapsed/time/avg を含めてください。"
+  }
 
-  # 正規化して投影（パイプ未使用）
+  Write-Info ("Detected {0} latency column(s)." -f $latCands.Count)
+
+  # ロング化プロジェクション
   $proj = @()
-  foreach($r in $rows){
-    $tag = ($r.$tagCol) -as [string]
-    $tgt = if($tgtCol){ ($r.$tgtCol) -as [string] } else { $null }
-
-    # 数値化（'123ms' 形式にも一部対応）
-    $raw = ($r.$latCol) -as [string]
-    $lat = $null
-    if($raw -and ($raw -match '([-+]?\d+(\.\d+)?)')){ $lat = [double]$matches[1] }
-
-    if($lat -ne $null){
-      $proj += [pscustomobject]@{
-        Tag = $tag
-        Target = if($tgt){ $tgt } else { "_(all)" }
-        LatencyMs = $lat
+  if($latCands.Count -eq 1){
+    $latName = $latCands[0].Name
+    foreach($r in $rows){
+      $tag = if($tagCol){ ($r.$tagCol -as [string]) } else { $null }
+      $tgt = if($tgtCol){ ($r.$tgtCol -as [string]) } else { "_(all)" }
+      $lat = Parse-DoubleOrNull ($r.$latName -as [string])
+      if($lat -ne $null){
+        $proj += [pscustomobject]@{
+          Tag = if([string]::IsNullOrWhiteSpace($tag)){"_(blank)"}else{$tag}
+          Target = if([string]::IsNullOrWhiteSpace($tgt)){"_(all)"}else{$tgt}
+          LatencyMs = $lat
+        }
+      }
+    }
+  } else {
+    # 複数列 -> 列名から Target を推定してロング化
+    foreach($r in $rows){
+      $tag = if($tagCol){ ($r.$tagCol -as [string]) } else { $null }
+      foreach($c in $latCands){
+        $lat = Parse-DoubleOrNull ($r.($c.Name) -as [string])
+        if($lat -eq $null){ continue }
+        $tgtFromHeader = $c.Suffix
+        if(-not $tgtFromHeader -or $tgtFromHeader -eq ''){ $tgtFromHeader = $c.Name }  # 後方互換
+        $proj += [pscustomobject]@{
+          Tag = if([string]::IsNullOrWhiteSpace($tag)){"_(blank)"}else{$tag}
+          Target = $tgtFromHeader
+          LatencyMs = $lat
+        }
       }
     }
   }
 
-  if(-not $proj -or $proj.Count -eq 0){ throw "有効なレイテンシ行がありません（数値に変換できませんでした）。" }
+  if(-not $proj -or $proj.Count -eq 0){ throw "有効なレイテンシ値が1件もありません。" }
 
-  # 手動グルーピング（Tag, Target）※パイプ未使用
+  # 手動グルーピング（Tag, Target）
   $dict = @{}
   foreach($p in $proj){
-    $tagKey = if([string]::IsNullOrWhiteSpace($p.Tag)){"_(blank)"}else{$p.Tag}
-    $key = "$tagKey`t$($p.Target)"
+    $key = "$($p.Tag)`t$($p.Target)"
     if(-not $dict.ContainsKey($key)){
       $dict[$key] = [pscustomobject]@{
-        Tag = $tagKey
+        Tag = $p.Tag
         Target = $p.Target
         Values = @()
       }
@@ -195,8 +272,7 @@ try{
     }
   }
 
-  # 並び替え（安定のため、簡易バブル/比較で並べ替え）
-  # PowerShell 5.1 でも Sort-Object は安全ですが、パイプ無しで実装
+  # 並び替え（Tag, Target）
   $sorted = @($outRows)
   for($i=0; $i -lt $sorted.Count; $i++){
     for($j=$i+1; $j -lt $sorted.Count; $j++){
@@ -213,11 +289,10 @@ try{
     }
   }
 
-  # CSV 出力（パイプ未使用）
+  # CSV 出力（手書き）
   $csvOut = Join-Path $Output "TagSummary.csv"
   Write-Info "Writing CSV: $csvOut"
   $lines = @()
-  # ヘッダ
   $lines += '"Tag","Target","Samples","AvgMs","P95Ms","OverThresholdCount","OverThresholdPct","ThresholdMs"'
   foreach($r in $sorted){
     $line = '"' + ($r.Tag -replace '"','""') + '","' +
@@ -235,23 +310,17 @@ try{
   # Excel 出力（Office 環境のみ）
   $xlsxOut = Join-Path $Output "TagSummary.xlsx"
   $excel = $null
-  try{
-    $excel = New-Object -ComObject Excel.Application
-  }catch{
-    Write-Info "Excel COM を作成できませんでした。CSV のみ出力します。"
-  }
-
+  try{ $excel = New-Object -ComObject Excel.Application }catch{}
   if($excel){
     try{
       $excel.Visible = $false
       $wb = $excel.Workbooks.Add()
-      # Summary シート
+      $headers = @('Tag','Target','Samples','AvgMs','P95Ms','OverThresholdCount','OverThresholdPct','ThresholdMs')
+
+      # Summary
       $ws = $wb.Worksheets.Item(1)
       $ws.Name = "Summary"
-      $headers = @('Tag','Target','Samples','AvgMs','P95Ms','OverThresholdCount','OverThresholdPct','ThresholdMs')
-      for($i=0;$i -lt $headers.Count;$i++){
-        $ws.Cells.Item(1, $i+1) = $headers[$i]
-      }
+      for($i=0;$i -lt $headers.Count;$i++){ $ws.Cells.Item(1, $i+1) = $headers[$i] }
       $row = 2
       foreach($r in $sorted){
         $ws.Cells.Item($row,1) = $r.Tag
@@ -264,31 +333,27 @@ try{
         $ws.Cells.Item($row,8) = $r.ThresholdMs
         $row++
       }
-      # Tag ごとに別シート
+
+      # Tag 毎のシート
       $byTag = @{}
-      foreach($r in $sorted){
-        if(-not $byTag.ContainsKey($r.Tag)){ $byTag[$r.Tag] = @() }
-        $byTag[$r.Tag] += $r
-      }
-      foreach($kv2 in $byTag.GetEnumerator()){
-        $name = Sanitize-WorksheetName $kv2.Key
+      foreach($r in $sorted){ if(-not $byTag.ContainsKey($r.Tag)){ $byTag[$r.Tag] = @() }; $byTag[$r.Tag] += $r }
+      foreach($kv in $byTag.GetEnumerator()){
+        $name = Sanitize-WorksheetName $kv.Key
         $sheet = $wb.Worksheets.Add()
-        $null = $sheet.Move($ws)   # 先頭へ
+        $null = $sheet.Move($ws)
         $sheet.Name = $name
-        for($i=0;$i -lt $headers.Count;$i++){
-          $sheet.Cells.Item(1, $i+1) = $headers[$i]
-        }
-        $ridx = 2
-        # Target の昇順で並べる
-        $grpSorted = @($kv2.Value)
-        for($i=0; $i -lt $grpSorted.Count; $i++){
-          for($j=$i+1; $j -lt $grpSorted.Count; $j++){
-            if([string]::Compare($grpSorted[$i].Target, $grpSorted[$j].Target) -gt 0){
-              $tmp2 = $grpSorted[$i]; $grpSorted[$i] = $grpSorted[$j]; $grpSorted[$j] = $tmp2
+        for($i=0;$i -lt $headers.Count;$i++){ $sheet.Cells.Item(1, $i+1) = $headers[$i] }
+        # Target 昇順で配置
+        $grp = @($kv.Value)
+        for($i=0; $i -lt $grp.Count; $i++){
+          for($j=$i+1; $j -lt $grp.Count; $j++){
+            if([string]::Compare($grp[$i].Target, $grp[$j].Target) -gt 0){
+              $t = $grp[$i]; $grp[$i] = $grp[$j]; $grp[$j] = $t
             }
           }
         }
-        foreach($r in $grpSorted){
+        $ridx = 2
+        foreach($r in $grp){
           $sheet.Cells.Item($ridx,1) = $r.Tag
           $sheet.Cells.Item($ridx,2) = $r.Target
           $sheet.Cells.Item($ridx,3) = $r.Samples
@@ -301,25 +366,25 @@ try{
         }
       }
 
-      # 体裁（見出し太字＋オートフィット）
-      $sheetCount = $wb.Worksheets.Count
-      for($i=1; $i -le $sheetCount; $i++){
+      # 体裁
+      $cnt = $wb.Worksheets.Count
+      for($i=1; $i -le $cnt; $i++){
         $s = $wb.Worksheets.Item($i)
         $s.Rows.Item(1).Font.Bold = $true
         $null = $s.Columns.AutoFit()
       }
 
-      Write-Info "Saving Excel: $xlsxOut"
       $wb.SaveAs($xlsxOut)
       $wb.Close($true)
-    }finally{
+    } finally {
       $null = $excel.Quit()
       [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel)
     }
   }
 
   Write-Info "Done."
-}catch{
+}
+catch{
   Write-Error $_.Exception.Message
   exit 1
 }
