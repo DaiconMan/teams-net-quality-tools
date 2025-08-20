@@ -1,87 +1,107 @@
-# Merge-TeamsNet-CSV.ps1 — 名前付き引数専用
-# -InputCsvs / -Tags / -Output [/ -Utf8Bom(無視)] [/ -SplitByDate] [/ -DateColumn timestamp] [/ -DateFormat yyyyMMdd] [/ -OutputDir <dir>]
+# Merge-TeamsNet-CSV.ps1
+# 目的: 各入力フォルダ内の path_hop_quality.csv（等、指定CSV）を**加工せず**マージする。
+# 注意: カラムは現状維持（dest_ip を含む）。入力に無ければ空欄で出力。
+# PS 5.1 対応（?: 不使用）、$Host 変数は未使用。OneDrive/日本語パス対応。
 
 [CmdletBinding()]
 param(
-  # 位置指定で渡されたら明示エラー
-  [Parameter(Position=0)][AllowNull()][string]$__arg0,
-  [Parameter(Position=1)][AllowNull()][string]$__arg1,
-
-  # 必ず「名前付き」で指定（文字列/配列/「;」区切り いずれも可）
+  # ; 区切り or 配列 で CSV ファイルパス（例: .\A\path_hop_quality.csv;.\B\path_hop_quality.csv）
   [Parameter(Mandatory=$true)][object]$InputCsvs,
+  # 各CSVに対応するタグ（; 区切り or 配列）。空なら親フォルダ名を自動採用
   [Parameter(Mandatory=$true)][object]$Tags,
 
-  # まとめて1本に出すときの出力先（既定）
+  # 1本出力 or 日別分割
   [Parameter()][string]$Output = ".\merged_teams_net_quality.csv",
-
-  # 互換のため残すが本スクリプトでは未使用（常にUTF-8で出力）
-  [switch]$Utf8Bom,
-
-  # 追加: 日別でファイルを分けて出力
-  [switch]$SplitByDate,
-  # 日付抽出に使う列名（既定: timestamp）
-  [string]$DateColumn = "timestamp",
-  # 出力ファイル名に使う日付フォーマット
-  [string]$DateFormat = "yyyyMMdd",
-  # 分割出力の出力ディレクトリ（未指定なら Output の親フォルダ）
-  [string]$OutputDir
+  [Parameter()][switch]$SplitByDate,
+  [Parameter()][string]$DateColumn = "timestamp",
+  [Parameter()][string]$DateFormat = "yyyyMMdd",
+  [Parameter()][string]$OutputDir
 )
 
-# 位置指定の明示ブロック
-if ($PSBoundParameters.ContainsKey('__arg0') -and $null -ne $__arg0) {
-  throw "このスクリプトは『名前付き引数のみ』対応です。-InputCsvs と -Tags を必ず付けてください。"
-}
-if ($PSBoundParameters.ContainsKey('__arg1') -and $null -ne $__arg1) {
-  throw "このスクリプトは『名前付き引数のみ』対応です。-InputCsvs と -Tags を必ず付けてください。"
-}
-
-$ErrorActionPreference = 'Stop'
-
-function To-StringArray([object]$x){
-  if($null -eq $x){ return @() }
-  if($x -is [string]){
-    $s=$x.Trim()
-    if($s -like "*;*"){ return ($s -split ';') | ForEach-Object { $_.Trim('"',' ').Trim() } }
-    else{ return @($s) }
-  } elseif($x -is [System.Collections.IEnumerable] -and -not ($x -is [string])) {
-    $o=@(); foreach($e in $x){ $o+=@("$e") }; return $o
-  } else { return @("$x") }
+# -------- helpers --------
+function To-StringArray([object]$v){
+  if($null -eq $v){ return @() }
+  if($v -is [System.Array]){ return @($v | ForEach-Object { [string]$_ }) }
+  $s = [string]$v
+  if([string]::IsNullOrWhiteSpace($s)){ return @() }
+  if($s.Contains(";")){ return @($s.Split(";",[System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }) }
+  return @($s)
 }
 
 function Get-DayKey([object]$v, [string]$fmt="yyyyMMdd"){
-  $s = if($v -ne $null){ [string]$v } else { '' }
+  $s = if($v -ne $null){ [string]$v } else { "" }
   if($s -match '^\s*(\d{4})[/-](\d{2})[/-](\d{2})'){
     return ('{0}{1}{2}' -f $Matches[1],$Matches[2],$Matches[3])
   }
-  try { return ([datetime]$s).ToString($fmt) } catch { return 'Unknown' }
+  try { return ([datetime]$s).ToString($fmt) } catch { return "Unknown" }
 }
 
-# 入力正規化
+# -------- main --------
 $files = To-StringArray $InputCsvs
 $tags  = To-StringArray $Tags
 
-# フルパス化 & 存在検証
-$files = foreach($p in $files){
+# 検証 & 正規化（フルパス化）
+$resolved = New-Object System.Collections.Generic.List[string]
+foreach($p in $files){
   if(-not (Test-Path -LiteralPath $p)){ throw "CSV not found: $p" }
-  (Resolve-Path -LiteralPath $p).Path
+  $rp = (Resolve-Path -LiteralPath $p).Path
+  [void]$resolved.Add($rp)
+}
+$files = @($resolved)
+
+# タグ補完（空なら末端フォルダ名）
+if($tags.Count -eq 0){
+  $tags = @()
+  foreach($f in $files){
+    $dir = Split-Path -Parent $f
+    $tags += (Split-Path -Leaf $dir)
+  }
 }
 if($files.Count -ne $tags.Count){
   throw "Files($($files.Count)) と Tags($($tags.Count)) の数が一致しません。-InputCsvs と -Tags を見直してください。"
 }
 
-# ヘッダー和集合（大文字小文字無視）
+# ヘッダー和集合（大小無視）。現状維持カラムを**強制**含める。
 $cmp = [System.StringComparer]::OrdinalIgnoreCase
-$all = New-Object System.Collections.Generic.HashSet[string] $cmp
+$headerSet = New-Object System.Collections.Generic.HashSet[string] $cmp
 
-# 付与するメタ列（※ machine / user は含めない）
-$meta = @('probe','tz_offset','source_file')
-foreach($m in $meta){ [void]$all.Add($m) }
+# 現状維持のために必ず残す列（dest_ip とメタ列）
+$forceColumns = @('dest_ip') # ※ 入力に無い場合は空で出力（列構成維持）
+$metaColumns  = @('probe','tz_offset','source_file') # 既存どおり末尾に付与
 
-$datasets = @()
+foreach($f in $files){
+  try   { $rows = Import-Csv -Path $f -Encoding UTF8 }
+  catch { $rows = Import-Csv -Path $f -Encoding Default }
+  if(-not $rows -or $rows.Count -eq 0){ continue }
+  foreach($n in $rows[0].PSObject.Properties.Name){ [void]$headerSet.Add($n) }
+}
+foreach($fc in $forceColumns){ [void]$headerSet.Add($fc) }
 
-for($i=0;$i -lt $files.Count;$i++){
-  $path = $files[$i]; $tag  = $tags[$i]
+# 最終ヘッダー（入力順に近い安定化：最初のCSVの順 → 和集合残り → 強制列 → メタ列）
+$ordered = @()
+if($files.Count -gt 0){
+  try   { $firstRows = Import-Csv -Path $files[0] -Encoding UTF8 }
+  catch { $firstRows = Import-Csv -Path $files[0] -Encoding Default }
+  if($firstRows -and $firstRows.Count -gt 0){
+    foreach($n in $firstRows[0].PSObject.Properties.Name){
+      if($headerSet.Contains($n) -and -not $ordered.Contains($n)){ $ordered += $n }
+    }
+  }
+}
+# 和集合の残り
+foreach($h in $headerSet){
+  if(-not ($ordered -contains $h)){ $ordered += $h }
+}
 
+# メタ列は最後
+$allHeaders = @($ordered + $metaColumns)
+
+# 出力準備
+$outList = New-Object System.Collections.Generic.List[object]
+$tz = ([datetimeoffset](Get-Date)).ToString("zzz")
+
+for($i=0; $i -lt $files.Count; $i++){
+  $path = $files[$i]; $tag = $tags[$i]
   try   { $rows = Import-Csv -Path $path -Encoding UTF8 }
   catch { $rows = Import-Csv -Path $path -Encoding Default }
 
@@ -90,94 +110,49 @@ for($i=0;$i -lt $files.Count;$i++){
     continue
   }
 
-  foreach($n in $rows[0].PSObject.Properties.Name){
-    $null = $all.Add($n)
-  }
+  foreach($r in $rows){
+    $row = [ordered]@{}
+    foreach($h in $ordered){
+      if($r.PSObject.Properties.Name -contains $h){
+        $row[$h] = $r.$h
+      } else {
+        # 大文字小文字違いを吸収
+        $k = $r.PSObject.Properties.Name | Where-Object { $_ -ieq $h } | Select-Object -First 1
+        if($k){ $row[$h] = $r.$k } else { $row[$h] = $null }
+      }
+    }
+    # 現状どおりメタ列を最後に付与（machine/user は出力しない仕様）
+    $row['probe']       = $tag
+    $row['tz_offset']   = $tz
+    $row['source_file'] = $path
 
-  $datasets += [pscustomobject]@{
-    Path = $path
-    Tag  = $tag
-    Rows = $rows
+    [void]$outList.Add([pscustomobject]$row)
   }
 }
-if($datasets.Count -eq 0){ throw "有効な入力CSVがありませんでした。" }
 
-# 和集合ヘッダー（既存列→メタ列）
-$existingHeaders = @()
-foreach($h in $all){ if($meta -notcontains $h){ $existingHeaders += $h } }
-$allHeaders = @($existingHeaders + $meta)
+if($outList.Count -eq 0){ throw "有効な入力CSVがありませんでした。" }
 
-# 出力生成（SplitByDate の場合は日単位で分配）
 if($SplitByDate){
-  # 出力ディレクトリを決定
-  $baseDir = if($OutputDir){
-    $OutputDir
-  } else {
-    $parent = Split-Path -Parent $Output
-    if([string]::IsNullOrWhiteSpace($parent)){ '.' } else { $parent }
+  $baseDir = $OutputDir
+  if([string]::IsNullOrWhiteSpace($baseDir)){
+    $p = Split-Path -Parent $Output
+    if([string]::IsNullOrWhiteSpace($p)){ $baseDir = '.' } else { $baseDir = $p }
   }
   if(-not (Test-Path -LiteralPath $baseDir)){ New-Item -ItemType Directory -Path $baseDir | Out-Null }
 
-  # dayKey => List[pscustomobject]
-  $groups = @{}
-
-  foreach($ds in $datasets){
-    $tz = [TimeZoneInfo]::Local.BaseUtcOffset.TotalHours
-    foreach($r in $ds.Rows){
-      $row = [ordered]@{}
-      foreach($h in $allHeaders){
-        if($meta -contains $h){ continue }
-        if($r.PSObject.Properties.Name -contains $h){
-          $row[$h] = $r.$h
-        } else {
-          $k = $r.PSObject.Properties.Name | Where-Object { $_ -ieq $h } | Select-Object -First 1
-          $row[$h] = if($k){ $r.$k } else { $null }
-        }
-      }
-      # メタ列（machine/user は出さない）
-      $row['probe']       = $ds.Tag
-      $row['tz_offset']   = $tz
-      $row['source_file'] = $ds.Path
-
-      $obj = [pscustomobject]$row
-      $key = if($row.Contains($DateColumn)){ Get-DayKey $row[$DateColumn] $DateFormat } else { 'Unknown' }
-
-      if(-not $groups.ContainsKey($key)){
-        $groups[$key] = New-Object System.Collections.Generic.List[object]
-      }
-      [void]$groups[$key].Add($obj)
+  # ヘッダーは Export-Csv に任せる（追記）
+  foreach($o in $outList){
+    $day = "Unknown"
+    $dc = $DateColumn
+    if($o.PSObject.Properties.Name -contains $dc){
+      $day = Get-DayKey $o.$dc $DateFormat
     }
+    $file = Join-Path $baseDir ("merged_{0}.csv" -f $day)
+    $exists = Test-Path -LiteralPath $file
+    $o | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8 -Append:($exists) -Force
   }
-
-  # 書き出し（キーごとにファイル）
-  foreach($k in ($groups.Keys | Sort-Object)){
-    $file = Join-Path $baseDir ("merged_{0}.csv" -f $k)
-    $groups[$k] | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $file
-    Write-Host "Merged -> $file (`"$($groups[$k].Count)`" rows)"
-  }
-}
-else{
-  # 1本にまとめて出力
-  $out = New-Object System.Collections.Generic.List[object]
-  foreach($ds in $datasets){
-    $tz = [TimeZoneInfo]::Local.BaseUtcOffset.TotalHours
-    foreach($r in $ds.Rows){
-      $row = [ordered]@{}
-      foreach($h in $allHeaders){
-        if($meta -contains $h){ continue }
-        if($r.PSObject.Properties.Name -contains $h){
-          $row[$h] = $r.$h
-        } else {
-          $k = $r.PSObject.Properties.Name | Where-Object { $_ -ieq $h } | Select-Object -First 1
-          $row[$h] = if($k){ $r.$k } else { $null }
-        }
-      }
-      $row['probe']       = $ds.Tag
-      $row['tz_offset']   = $tz
-      $row['source_file'] = $ds.Path
-      [void]$out.Add([pscustomobject]$row)
-    }
-  }
-  $out | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Output
-  Write-Host "Merged -> $Output (`"$($out.Count)`" rows)"
+  Write-Host ("Split merged -> {0}" -f $baseDir)
+} else {
+  $outList | Export-Csv -Path $Output -NoTypeInformation -Encoding UTF8
+  Write-Host ("Merged -> {0} (""{1}"" rows)" -f $Output, $outList.Count)
 }
