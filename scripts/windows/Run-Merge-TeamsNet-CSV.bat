@@ -75,8 +75,18 @@ echo --- 収集とマージを開始 ---
   "  if(-not [string]::IsNullOrWhiteSpace('%DATEFMT%')){  $params['DateFormat']  = '%DATEFMT%' }" ^
   "  if(-not [string]::IsNullOrWhiteSpace('%OUTDIR%')){   $params['OutputDir']   = [IO.Path]::GetFullPath('%OUTDIR%') }" ^
   "}" ^
-  "& (Get-Item -LiteralPath $mergeScript).FullName @params" ^
-  "; if($?) { if('%SPLIT%' -eq '1'){ Write-Host ('* 分割出力完了 -> {0}' -f ($params.OutputDir ?? Split-Path -Parent $params.Output)) } else { Write-Host ('* 出力: {0}' -f $params.Output) }; exit 0 } else { exit 1 }"
+  "& (Get-Item -LiteralPath $mergeScript).FullName @params;" ^
+  "if($?){" ^
+  "  if('%SPLIT%' -eq '1'){" ^
+  "    $outDirFinal = if($params.ContainsKey('OutputDir') -and $params['OutputDir']) { $params['OutputDir'] } else { Split-Path -Parent $params['Output'] };" ^
+  "    Write-Host ('* 分割出力完了 -> {0}' -f $outDirFinal);" ^
+  "  } else {" ^
+  "    Write-Host ('* 出力: {0}' -f $params['Output']);" ^
+  "  }" ^
+  "  exit 0" ^
+  "} else {" ^
+  "  exit 1" ^
+  "}"
 
 set "RC=%ERRORLEVEL%"
 echo * 終了コード: %RC%
