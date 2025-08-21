@@ -5,15 +5,19 @@
     * targets.csv（UTF-8） … ヘッダー: role,key,label
     * node_roles.csv（UTF-8, 任意） … ヘッダー: ip_of_host,role,label,segment
     * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag,(任意: ap / ap_name)
-  - 主要仕様（今回のポイント）
+  - 主要仕様
     * フィルタ採用条件: host / hop_ip / target のいずれかが targets.key に一致した行のみ採用
-    * 表示キー: 採用された行は **常に teams_net_quality.csv の host を採用**（host空欄時のみフォールバック）
+    * 表示キー: 採用された行は常に teams_net_quality.csv の host を採用（host空欄時のみフォールバック）
     * role/label: host→target→hop の順で targets から付与、なければ node_roles で補完
     * SAAS 集計: 採用role=SAAS の行は http_head_ms、それ以外は icmp_avg_ms を使用
-    * area/floor/tag: teams.bssid ↔ floors.bssid のみで付与（targets は無関与）
+    * area/floor/tag: teams.bssid ↔ floors.bssid 一致のみで付与
     * AP表示: teams.ap_name → floors.(ap|ap_name) → BSSIDラベル
-    * UI: 行クリックで詳細折りたたみ＋時系列ミニグラフ、最悪時間帯（0–23時平均で最大の時間帯）を表示
-  - ログ: -EnableCompareLog で比較ログ（候補/採用/ドロップ/メトリクス）を出力
+    * HTML UI:
+        - 行クリックで詳細折りたたみ＋時系列ミニグラフ
+        - 「最悪時間帯」列: 0–23時の平均で最悪な時間帯を求め、その時間帯内の最悪値も併記（例 15時台 (183 ms)）
+        - ヘッダークリックでソート（トグル）
+        - P95ヘッダーに解説ツールチップ
+  - ログ: -EnableCompareLog で候補/採用/ドロップ/メトリクスを出力
   - 注意: 三項演算子( ?: )不使用 / $Host未使用 / UTF-8 BOM 出力 / OneDrive・日本語パス対応
 #>
 
@@ -31,15 +35,11 @@ param(
   [int]$MaxCompareLogLines = 200
 )
 
-# ===== ヘルパ =====
-function Parse-Double {
-  param([string]$s)
+function Parse-Double { param([string]$s)
   if ([string]::IsNullOrWhiteSpace($s)) { return $null }
   $t = ($s -replace '[^0-9\.\-]', '')
   $val = 0.0
-  if ([double]::TryParse($t, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) {
-    return [double]$val
-  }
+  if ([double]::TryParse($t, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) { return [double]$val }
   return $null
 }
 function Get-Median { param([double[]]$arr)
@@ -164,7 +164,7 @@ foreach($f in $floors){
   if (-not (Is-BlankOrUnknown $apCandidate)) { $apByBssid[$b] = $apCandidate }
 }
 
-# ===== 正規化 & マッチング（「一致していれば host 採用」ルール）=====
+# ===== 正規化 & マッチング（targets一致ならhost採用）=====
 $qual = @()
 $cntAdoptHost = 0
 $cntMatchHost = 0; $cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
@@ -177,28 +177,23 @@ foreach($q in $teams){
   $tgtKey = Safe-Lower $q.target
   $hstKey = Safe-Lower $q.host
 
-  $inTgt_hst = $false
-  $inTgt_hop = $false
-  $inTgt_tgt = $false
-  if (-not [string]::IsNullOrWhiteSpace($hstKey)) { if ($targetSet.ContainsKey($hstKey)) { $inTgt_hst = $true } }
-  if (-not [string]::IsNullOrWhiteSpace($hopKey)) { if ($targetSet.ContainsKey($hopKey)) { $inTgt_hop = $true } }
-  if (-not [string]::IsNullOrWhiteSpace($tgtKey)) { if ($targetSet.ContainsKey($tgtKey)) { $inTgt_tgt = $true } }
+  $inTgt_hst = $false; if (-not [string]::IsNullOrWhiteSpace($hstKey)) { if ($targetSet.ContainsKey($hstKey)) { $inTgt_hst = $true } }
+  $inTgt_hop = $false; if (-not [string]::IsNullOrWhiteSpace($hopKey)) { if ($targetSet.ContainsKey($hopKey)) { $inTgt_hop = $true } }
+  $inTgt_tgt = $false; if (-not [string]::IsNullOrWhiteSpace($tgtKey)) { if ($targetSet.ContainsKey($tgtKey)) { $inTgt_tgt = $true } }
 
   # 候補ロールの取得
   $roleHst = $null; if ($roleByKey.ContainsKey($hstKey)) { $roleHst = $roleByKey[$hstKey] }
   $roleHop = $null; if ($roleByKey.ContainsKey($hopKey)) { $roleHop = $roleByKey[$hopKey] }
   $roleTgt = $null; if ($roleByKey.ContainsKey($tgtKey)) { $roleTgt = $roleByKey[$tgtKey] }
 
-  # 比較ログ: 候補一覧
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     Log-Line ("cmp-candidates: host={0} in={1} role={2} | hop={3} in={4} role={5} | target={6} in={7} role={8}" -f `
-      $hstKey, $inTgt_hst, ($(if ($null -ne $roleHst){$roleHst}else{""})), `
-      $hopKey, $inTgt_hop, ($(if ($null -ne $roleHop){$roleHop}else{""})), `
-      $tgtKey, $inTgt_tgt, ($(if ($null -ne $roleTgt){$roleTgt}else{""})))
+      $hstKey,$inTgt_hst,($(if ($null -ne $roleHst){$roleHst}else{""})), `
+      $hopKey,$inTgt_hop,($(if ($null -ne $roleHop){$roleHop}else{""})), `
+      $tgtKey,$inTgt_tgt,($(if ($null -ne $roleTgt){$roleTgt}else{""})))
     $lineBudget = $lineBudget - 1
   }
 
-  # いずれか一致すれば採用、表示キーは host（host空欄時のみフォールバック）
   $anyMatch = $inTgt_hst -or $inTgt_hop -or $inTgt_tgt
   if (-not $anyMatch) {
     $cntDropped++
@@ -209,15 +204,15 @@ foreach($q in $teams){
     continue
   }
 
-  $displayKey = $hstKey
-  $pickSrc = "host"
+  # 表示キーは host を最優先
+  $displayKey = $hstKey; $pickSrc = "host"
   if ([string]::IsNullOrWhiteSpace($displayKey)) {
     if ($inTgt_hop) { $displayKey = $hopKey; $pickSrc = "hop(fallback)" }
     elseif ($inTgt_tgt) { $displayKey = $tgtKey; $pickSrc = "target(fallback)" }
     else { $displayKey = $hopKey; $pickSrc = "fallback(empty-host)" }
   }
 
-  # 採用role/label/segment の決定: host→target→hop の順
+  # 採用role/label/segment: host→target→hop の順
   $matchRole=$null; $matchLabel=$null; $segmentVal=""
   if ($roleByKey.ContainsKey($hstKey)) {
     $matchRole  = $roleByKey[$hstKey]
@@ -235,14 +230,12 @@ foreach($q in $teams){
     if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
     $cntMatchHop++
   } else {
-    # 役割未設定のまま（targetsにrole無し）→ node_rolesで補完
     if ($segmentByNode.ContainsKey($displayKey)) { $segmentVal = $segmentByNode[$displayKey] }
   }
   if ([string]::IsNullOrWhiteSpace($matchRole))  { $matchRole  = "Uncategorized" }
   if ([string]::IsNullOrWhiteSpace($matchLabel)) { $matchLabel = $displayKey }
 
   $cntAdoptHost++
-
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     Log-Line ("cmp-pick: displayKey={0} src={1} role={2} label={3}" -f $displayKey,$pickSrc,$matchRole,$matchLabel)
     $lineBudget = $lineBudget - 1
@@ -277,16 +270,12 @@ foreach($q in $teams){
   $http = Parse-Double $q.http_head_ms
   $roleNorm = $matchRole.ToString().Trim().ToUpper()
   $metric = $null; $metricKind = "RTT"
-  if ($roleNorm -eq "SAAS") {
-    if ($null -ne $http) { $metric = $http; $metricKind = "HTTP" }
-    else { $metric = $rtt; $metricKind = "RTT" }
-  } else { $metric = $rtt; $metricKind = "RTT" }
+  if ($roleNorm -eq "SAAS") { if ($null -ne $http) { $metric = $http; $metricKind = "HTTP" } else { $metric = $rtt; $metricKind = "RTT" } }
+  else { $metric = $rtt; $metricKind = "RTT" }
   $jit  = Parse-Double $q.icmp_jitter_ms
   $loss = Parse-Double $q.loss_pct
   $mos  = Parse-Double $q.mos_estimate
-  if ($null -eq $mos -and $null -ne $rtt -and $null -ne $loss) {
-    $mos = [math]::Round((4.5 - 0.0004*[double]$rtt - 0.1*[double]$loss),2)
-  }
+  if ($null -eq $mos -and $null -ne $rtt -and $null -ne $loss) { $mos = [math]::Round((4.5 - 0.0004*[double]$rtt - 0.1*[double]$loss),2) }
 
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     $lbssid = if ($null -eq $bNorm) { "(empty)" } else { $bNorm }
@@ -296,32 +285,28 @@ foreach($q in $teams){
 
   $obj = [PSCustomObject]@{
     timestamp = $q.timestamp
-    target    = $displayKey   # ← 一致していれば常に host を表示キーに採用
+    target    = $displayKey
     role      = $matchRole
     label     = $matchLabel
     segment   = $segmentVal
-    # メトリクス
     metric_ms = $metric
     metric_kind = $metricKind
     rtt_ms    = $rtt
     jitter_ms = $jit
     loss_pct  = $loss
     mos       = $mos
-    # 無線
     ssid      = $q.ssid
     bssid     = $bNorm
     ap_key    = $apKey
     ap_label  = $apLabel
-    # ロケーション
     area      = $areaVal
     floor     = $floorVal
     ap_tag    = $tagVal
   }
-
   $qual += $obj
 }
 
-# ===== 明細（グラフ用）をグループキーごとに保持 =====
+# ===== 明細（グラフ用） =====
 $detailMap = @{}
 foreach($o in $qual){
   $gk = ('{0}|{1}|{2}|{3}|{4}' -f $o.area, $o.ap_key, $o.target, $o.role, $o.segment)
@@ -331,7 +316,7 @@ foreach($o in $qual){
   }
 }
 
-# ===== 集計（エリア / APキー / 対象 / 役割）=====  ※metric_msで算出
+# ===== 集計 =====
 $summaryRows = @()
 $groups = $qual | Group-Object -Property area, ap_key, target, role, segment
 foreach($g in $groups){
@@ -372,12 +357,12 @@ $detailsOrdered = [ordered]@{}
 foreach($k in $detailMap.Keys){ $detailsOrdered[$k] = $detailMap[$k] }
 $detailsJson = ($detailsOrdered | ConvertTo-Json -Depth 6)
 
-# ===== HTML（@'…'@ + JSON置換, UTF-8 BOM出力）=====
+# ===== HTML =====
 $htmlTemplate = @'
 <!doctype html>
 <html lang="ja"><head>
 <meta charset="utf-8" />
-<title>NetQuality Report (クリック展開グラフ付き)</title>
+<title>NetQuality Report (クリック展開グラフ＋ソート)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; margin: 16px; }
@@ -386,7 +371,7 @@ $htmlTemplate = @'
   select, input { padding:6px; border:1px solid #ccc; border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; margin: 8px 0 24px; }
   th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
-  th { background: #fafafa; position: sticky; top:0; z-index: 1; }
+  th { background: #fafafa; position: sticky; top:0; z-index: 1; cursor: pointer; user-select:none; }
   tr.detail td { background:#fafcff; padding:12px 8px; }
   .mono { font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; }
   .rt-ok{background:#e7f7e7;} .rt-warn{background:#fff5e0;} .rt-bad{background:#fdecec;} .loss-bad{background:#fdecec;}
@@ -394,9 +379,10 @@ $htmlTemplate = @'
   .hint{color:#666; font-size:12px;}
   .canvaswrap{width:100%; height:180px;}
   .meta { font-size:12px; color:#444; margin:4px 0 0; }
+  .sort-ind{margin-left:6px; opacity:.6;}
 </style>
 </head><body>
-  <h1>ネットワーク品質レポート（targets一致ならhost採用／行クリックで詳細グラフ）</h1>
+  <h1>ネットワーク品質レポート（targets一致ならhost採用／クリック展開＆ヘッダーソート）</h1>
 
   <div class="filters">
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
@@ -408,8 +394,18 @@ $htmlTemplate = @'
 
   <table id="sumTbl">
     <thead><tr>
-      <th>エリア</th><th>AP</th><th>対象</th><th>役割</th><th>セグメント</th>
-      <th>試行数</th><th>応答中央値(ms)</th><th>P95(ms)</th><th>ジッタ中央値</th><th>損失率(平均)</th><th>MOS(中央値)</th><th>最悪時間帯</th>
+      <th data-sort="area">エリア<span class="sort-ind"></span></th>
+      <th data-sort="ap_label">AP<span class="sort-ind"></span></th>
+      <th data-sort="target">対象<span class="sort-ind"></span></th>
+      <th data-sort="role">役割<span class="sort-ind"></span></th>
+      <th data-sort="segment">セグメント<span class="sort-ind"></span></th>
+      <th data-sort="count">試行数<span class="sort-ind"></span></th>
+      <th data-sort="resp_med">応答中央値(ms)<span class="sort-ind"></span></th>
+      <th data-sort="resp_p95" title="P95: 応答遅延の95パーセンタイル。全データを小さい順に並べ、上位5%を除いた境界値。ピーク遅延の傾向把握に有効。">P95(ms)<span class="sort-ind"></span></th>
+      <th data-sort="jit_med">ジッタ中央値<span class="sort-ind"></span></th>
+      <th data-sort="loss_avg">損失率(平均)<span class="sort-ind"></span></th>
+      <th data-sort="mos_med">MOS(中央値)<span class="sort-ind"></span></th>
+      <th data-sort="worst_value">最悪時間帯<span class="sort-ind"></span></th>
     </tr></thead><tbody></tbody>
   </table>
 
@@ -437,24 +433,53 @@ function colorResp(td,v){if(v==null)return;if(v<50)td.classList.add('rt-ok');els
 function colorLoss(td,v){if(v!=null&&v>3)td.classList.add('loss-bad');}
 function hourString(h){ return (h<10?("0"+h):h) + "時台"; }
 
-function worstHour(points){
-  if(!points||points.length===0) return "";
-  var buckets = new Array(24), counts = new Array(24);
-  for(var i=0;i<24;i++){ buckets[i]=0; counts[i]=0; }
+var worstCache={};
+function worstHourAndValue(points,gkey){
+  if(worstCache[gkey]) return worstCache[gkey];
+  var res={label:"", hour:-1, value:null};
+  if(!points||points.length===0){ worstCache[gkey]=res; return res; }
+
+  var buckets=new Array(24), counts=new Array(24);
+  for(var i=0;i<24;i++){buckets[i]=0;counts[i]=0;}
   for(var i=0;i<points.length;i++){
-    var t = new Date(points[i].ts); if(isNaN(t)) continue;
-    var h = t.getHours(); var v = points[i].v; if(v==null) continue;
+    var t=new Date(points[i].ts); if(isNaN(t)) continue;
+    var h=t.getHours(), v=points[i].v; if(v==null) continue;
     buckets[h]+=v; counts[h]++;
   }
-  var worst=-1, wh=-1;
+  var worstAvg=-1, wh=-1;
   for(var h=0;h<24;h++){
     if(counts[h]===0) continue;
     var avg=buckets[h]/counts[h];
-    if(avg>worst){ worst=avg; wh=h; }
+    if(avg>worstAvg){ worstAvg=avg; wh=h; }
   }
-  if(wh<0) return "";
-  return hourString(wh);
+  if(wh<0){ worstCache[gkey]=res; return res; }
+
+  // その時間帯に属するデータの中で最悪値
+  var maxInHour=null;
+  for(var i=0;i<points.length;i++){
+    var t=new Date(points[i].ts); if(isNaN(t)) continue;
+    if(t.getHours()!==wh) continue;
+    var v=points[i].v; if(v==null) continue;
+    if(maxInHour==null || v>maxInHour) maxInHour=v;
+  }
+  res.hour=wh; res.value=maxInHour;
+  res.label = hourString(wh) + (maxInHour!=null?(" ("+Math.round(maxInHour)+" ms)"):"");
+  worstCache[gkey]=res; return res;
 }
+
+var sortKey=null, sortAsc=true;
+function setSortIndicator(){
+  var ths=document.querySelectorAll('thead th');
+  for(var i=0;i<ths.length;i++){
+    var th=ths[i]; var span=th.querySelector('.sort-ind');
+    if(!span) continue;
+    var k=th.getAttribute('data-sort');
+    if(k && k===sortKey){ span.textContent = sortAsc ? "▲" : "▼"; }
+    else { span.textContent=""; }
+  }
+}
+
+var tableBody=document.querySelector('#sumTbl tbody');
 
 function drawLineChart(canvas, points){
   var ctx=canvas.getContext('2d');
@@ -505,23 +530,47 @@ function drawLineChart(canvas, points){
 
 function render(){
   var area=areaSel.value||"",ap=apSel.value||"",role=roleSel.value||"",seg=segSel.value||"",q=(qInput.value||"").toLowerCase();
-  var tbody=document.querySelector('#sumTbl tbody'); tbody.innerHTML='';
 
-  var rows=summaryRows.slice().sort(function(a,b){
-    var ka=(a.area||"")+"|"+(a.ap_label||""); var kb=(b.area||"")+"|"+(b.ap_label||"");
-    if(ka<kb)return-1;if(ka>kb)return 1; var ra=-1;if(a.resp_med!=null)ra=-a.resp_med; var rb=-1;if(b.resp_med!=null)rb=-b.resp_med; return ra-rb;
+  // フィルタ
+  var rows=summaryRows.filter(function(r){
+    if(area && r.area!==area) return false;
+    if(ap && (r.ap_label||"")!==ap) return false;
+    if(role && r.role!==role) return false;
+    if(seg && r.segment!==seg) return false;
+    if(q && String(r.target||"").toLowerCase().indexOf(q)===-1) return false;
+    return true;
   });
 
+  // ソート
+  rows.sort(function(a,b){
+    var ka, kb;
+    if(sortKey==="worst_value"){
+      var wa=worstHourAndValue(detailsMap[a.gkey]||[], a.gkey).value;
+      var wb=worstHourAndValue(detailsMap[b.gkey]||[], b.gkey).value;
+      ka=(wa==null?-Infinity:wa); kb=(wb==null?-Infinity:wb);
+    }else if(sortKey){
+      ka=a[sortKey]; kb=b[sortKey];
+      // 数値は数値で比較
+      var numKeys={"count":1,"resp_med":1,"resp_p95":1,"jit_med":1,"loss_avg":1,"mos_med":1};
+      if(numKeys[sortKey]){ ka=(ka==null?-Infinity:ka); kb=(kb==null?-Infinity:kb); }
+      else { ka=(ka||""); kb=(kb||""); }
+    }else{
+      // デフォルト：エリア→AP→応答中央値(昇順)
+      var keyA=(a.area||"")+"|"+(a.ap_label||""); var keyB=(b.area||"")+"|"+(b.ap_label||"");
+      if(keyA<keyB) return -1; if(keyA>keyB) return 1;
+      var ra=(a.resp_med!=null)?a.resp_med:1e12, rb=(b.resp_med!=null)?b.resp_med:1e12;
+      return ra-rb;
+    }
+    var cmp = (ka<kb)?-1:((ka>kb)?1:0);
+    return sortAsc?cmp:-cmp;
+  });
+
+  // 描画
+  tableBody.innerHTML='';
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
-    if(area && r.area!==area)continue;
-    if(ap && (r.ap_label||"")!==ap)continue;
-    if(role && r.role!==role)continue;
-    if(seg && r.segment!==seg)continue;
-    if(q && String(r.target||"").toLowerCase().indexOf(q)===-1)continue;
-
     var pts = detailsMap[r.gkey] || [];
-    var wh = worstHour(pts);
+    var wres = worstHourAndValue(pts, r.gkey);
 
     var tr=document.createElement('tr'); tr.className="main"; tr.dataset.gkey=r.gkey;
     function td(t){var e=document.createElement('td'); e.textContent=(t==null?"":t); return e;}
@@ -536,8 +585,9 @@ function render(){
     tr.appendChild(td(r.jit_med));
     var ls=td(r.loss_avg); colorLoss(ls,r.loss_avg); tr.appendChild(ls);
     tr.appendChild(td(r.mos_med));
-    tr.appendChild(td(wh));
+    tr.appendChild(td(wres.label));
 
+    // 詳細行
     var dtr=document.createElement('tr'); dtr.className="detail"; dtr.style.display="none";
     var tdwrap=document.createElement('td'); tdwrap.colSpan=12;
     var div=document.createElement('div'); div.className="canvaswrap";
@@ -547,24 +597,34 @@ function render(){
     meta.textContent="クリックで開閉／縦軸=ms（role=SAAS はHTTPヘッダ遅延、それ以外はICMP RTT）";
     tdwrap.appendChild(div); tdwrap.appendChild(meta); dtr.appendChild(tdwrap);
 
-    tr.addEventListener('click', function(trRef,dtrRef,cvRef,points){
+    tr.addEventListener('click', function(dtrRef,cvRef,points){
       return function(){
         if(dtrRef.style.display==="none"){ dtrRef.style.display="table-row"; drawLineChart(cvRef, points); }
         else { dtrRef.style.display="none"; }
       };
-    }(tr,dtr,canvas,pts));
+    }(dtr,canvas,pts));
 
-    tbody.appendChild(tr); tbody.appendChild(dtr);
+    tableBody.appendChild(tr); tableBody.appendChild(dtr);
   }
+  setSortIndicator();
 }
 render();
+
+// ヘッダークリックでソート
+var ths=document.querySelectorAll('thead th[data-sort]');
+for(var i=0;i<ths.length;i++){
+  ths[i].addEventListener('click',function(){
+    var k=this.getAttribute('data-sort');
+    if(sortKey===k){ sortAsc=!sortAsc; } else { sortKey=k; sortAsc=true; }
+    render();
+  });
+}
 </script>
 </body></html>
 '@
 
 $html = $htmlTemplate.Replace('__SUMMARY_JSON__', $summaryJson).Replace('__DETAILS_JSON__', $detailsJson)
 
-# ===== 出力 (UTF-8 BOM) =====
 try {
   $fullPath = [System.IO.Path]::GetFullPath($OutHtml)
   $dir = [System.IO.Path]::GetDirectoryName($fullPath)
@@ -579,7 +639,7 @@ try {
   Write-Warning "WriteAllText に失敗したため Out-File で出力しました。"
 }
 
-# ===== 参考メトリクス（数値のみ表示）=====
+# 参考メトリクス
 $total = $teams.Count
 $after = $qual.Count
 $mappedArea = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
