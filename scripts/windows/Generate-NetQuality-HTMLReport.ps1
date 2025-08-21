@@ -2,24 +2,24 @@
   Generate-NetQuality-HTMLReport.ps1 (PS 5.1 Compatible)
   - 入力CSV
     * teams_net_quality.csv（UTF-8 BOM）
-    * targets.csv（UTF-8） … ヘッダー: role,key,label
-    * node_roles.csv（UTF-8, 任意） … ヘッダー: ip_of_host,role,label,segment
+    * targets.csv（UTF-8） … ヘッダー: role,key,label（※役割判定には使用しない／フィルタのみ）
+    * node_roles.csv（UTF-8） … ヘッダー: ip_of_host,role,label,segment（★役割判定の唯一のソース）
     * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag,(任意: ap / ap_name)
+
   - 主要仕様
-    * フィルタ採用条件: host / hop_ip / target のいずれかが targets.key に一致した行のみ採用
-    * 表示キー: 採用された行は常に teams_net_quality.csv の host を採用（host空欄時のみフォールバック）
-    * role/label: host→target→hop の順で targets から付与、なければ node_roles で補完
-    * SAAS 集計: 採用role=SAAS の行は http_head_ms、それ以外は icmp_avg_ms を使用
+    * 採用フィルタ: host / hop_ip / target のいずれかが targets.key に一致した行のみ採用
+    * 表示キー: 採用された行は常に teams_net_quality.csv の host を採用（host空欄時は hop→target の順にフォールバック）
+    * 役割/ラベル/セグメント: ★node_roles.csv のみで決定（host→target→hop の順に参照）
+    * SAAS 集計: 役割=SAAS の行は http_head_ms、それ以外は icmp_avg_ms を使用
     * area/floor/tag: teams.bssid ↔ floors.bssid 一致のみで付与
     * AP表示: teams.ap_name → floors.(ap|ap_name) → BSSIDラベル
     * HTML UI:
-        - 行クリックで詳細折りたたみ＋時系列ミニグラフ
-        - 「最悪時間帯」列: 0–23時の平均で最悪な時間帯を求め、その時間帯内の最悪値も併記（例 15時台 (183 ms)）
+        - 行クリックで詳細グラフ（縦軸0–300ms固定／100ms赤破線／1時間ごとの縦補助線＋HH:00）
+        - 「最悪時間帯」列: 0–23時の平均で最悪な時間帯＋その時間帯の最悪値(ms)
         - ヘッダークリックでソート（トグル）
         - P95ヘッダーに解説ツールチップ
-        - 【今回追加】縦軸0–300ms固定／100ms赤破線／1時間ごとの縦の補助線＋HH:00ラベル
-  - ログ: -EnableCompareLog で候補/採用/ドロップ/メトリクスを出力
-  - 注意: 三項演算子( ?: )不使用 / $Host未使用 / UTF-8 BOM 出力 / OneDrive・日本語パス対応
+  - ログ: -EnableCompareLog で候補/採用/ドロップ/メトリクス、node_roles の参照結果を出力
+  - 注意: 三項演算子( ?: )不使用（PowerShell側） / $Host未使用 / UTF-8 BOM 出力 / OneDrive・日本語パス対応
 #>
 
 [CmdletBinding()]
@@ -36,11 +36,15 @@ param(
   [int]$MaxCompareLogLines = 200
 )
 
-function Parse-Double { param([string]$s)
+# ===== ヘルパ =====
+function Parse-Double {
+  param([string]$s)
   if ([string]::IsNullOrWhiteSpace($s)) { return $null }
   $t = ($s -replace '[^0-9\.\-]', '')
   $val = 0.0
-  if ([double]::TryParse($t, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) { return [double]$val }
+  if ([double]::TryParse($t, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) {
+    return [double]$val
+  }
   return $null
 }
 function Get-Median { param([double[]]$arr)
@@ -133,25 +137,27 @@ $roles   = @()
 if (Test-Path -LiteralPath $NodeRoleCsv) { $roles = Import-CsvUtf8 -Path $NodeRoleCsv }
 $floors  = Import-CsvUtf8 -Path $FloorsCsv
 
-Log-Line ("読み込み: teams={0}行, targets={1}行, roles={2}行, floors={3}行" -f $teams.Count,$targets.Count,$roles.Count,$floors.Count)
+Log-Line ("読み込み: teams={0}行, targets={1}行, node_roles={2}行, floors={3}行" -f $teams.Count,$targets.Count,$roles.Count,$floors.Count)
 
-# ===== targets辞書 =====
-$targetSet     = @{}; $roleByKey = @{}; $labelByKey = @{}
+# ===== targets（フィルタ用セットのみ）=====
+$targetSet = @{}
 foreach($t in $targets){
-  $k = Safe-Lower $t.key; if ([string]::IsNullOrWhiteSpace($k)) { continue }
+  $k = Safe-Lower $t.key
+  if ([string]::IsNullOrWhiteSpace($k)) { continue }
   $targetSet[$k] = $true
-  if (-not [string]::IsNullOrWhiteSpace($t.role))  { $roleByKey[$k]  = $t.role }
-  if (-not [string]::IsNullOrWhiteSpace($t.label)) { $labelByKey[$k] = $t.label }
 }
-# node_roles（補助）
+
+# ===== node_roles（役割判定の唯一ソース）=====
 $roleByNode=@{}; $labelByNode=@{}; $segmentByNode=@{}
 foreach($r in $roles){
-  $nk = Safe-Lower $r.ip_of_host; if ([string]::IsNullOrWhiteSpace($nk)) { continue }
+  $nk = Safe-Lower $r.ip_of_host
+  if ([string]::IsNullOrWhiteSpace($nk)) { continue }
   if (-not [string]::IsNullOrWhiteSpace($r.role))    { $roleByNode[$nk]   = $r.role }
   if (-not [string]::IsNullOrWhiteSpace($r.label))   { $labelByNode[$nk]  = $r.label }
   if (-not [string]::IsNullOrWhiteSpace($r.segment)) { $segmentByNode[$nk]= $r.segment }
 }
-# floors（BSSID完全一致 + 任意AP名）
+
+# ===== floors（BSSID完全一致 + 任意AP名）=====
 $areaByBssid=@{}; $floorByBssid=@{}; $tagByBssid=@{}; $apByBssid=@{}
 foreach($f in $floors){
   $b = Normalize-Bssid $f.bssid
@@ -165,10 +171,13 @@ foreach($f in $floors){
   if (-not (Is-BlankOrUnknown $apCandidate)) { $apByBssid[$b] = $apCandidate }
 }
 
-# ===== 正規化 & マッチング（targets一致ならhost採用）=====
+# ===== 正規化 & マッチング =====
 $qual = @()
 $cntAdoptHost = 0
-$cntMatchHost = 0; $cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
+$cntDropped   = 0
+$cntRoleFromHostNR = 0
+$cntRoleFromTargetNR = 0
+$cntRoleFromHopNR = 0
 $cntFloorHitExact = 0; $cntFloorMissEmpty = 0; $cntFloorMissNotFound = 0
 $cntApFromTeams=0; $cntApFromFloors=0; $cntApFromBssid=0; $cntApUnknown=0
 $lineBudget = $MaxCompareLogLines; if ($lineBudget -lt 0) { $lineBudget = 0 }
@@ -178,28 +187,15 @@ foreach($q in $teams){
   $tgtKey = Safe-Lower $q.target
   $hstKey = Safe-Lower $q.host
 
+  # 採用フィルタ（targets）
   $inTgt_hst = $false; if (-not [string]::IsNullOrWhiteSpace($hstKey)) { if ($targetSet.ContainsKey($hstKey)) { $inTgt_hst = $true } }
   $inTgt_hop = $false; if (-not [string]::IsNullOrWhiteSpace($hopKey)) { if ($targetSet.ContainsKey($hopKey)) { $inTgt_hop = $true } }
   $inTgt_tgt = $false; if (-not [string]::IsNullOrWhiteSpace($tgtKey)) { if ($targetSet.ContainsKey($tgtKey)) { $inTgt_tgt = $true } }
 
-  # 候補ロールの取得
-  $roleHst = $null; if ($roleByKey.ContainsKey($hstKey)) { $roleHst = $roleByKey[$hstKey] }
-  $roleHop = $null; if ($roleByKey.ContainsKey($hopKey)) { $roleHop = $roleByKey[$hopKey] }
-  $roleTgt = $null; if ($roleByKey.ContainsKey($tgtKey)) { $roleTgt = $roleByKey[$tgtKey] }
-
-  if ($EnableCompareLog -and $lineBudget -gt 0) {
-    Log-Line ("cmp-candidates: host={0} in={1} role={2} | hop={3} in={4} role={5} | target={6} in={7} role={8}" -f `
-      $hstKey,$inTgt_hst,($(if ($null -ne $roleHst){$roleHst}else{""})), `
-      $hopKey,$inTgt_hop,($(if ($null -ne $roleHop){$roleHop}else{""})), `
-      $tgtKey,$inTgt_tgt,($(if ($null -ne $roleTgt){$roleTgt}else{""})))
-    $lineBudget = $lineBudget - 1
-  }
-
-  $anyMatch = $inTgt_hst -or $inTgt_hop -or $inTgt_tgt
-  if (-not $anyMatch) {
+  if (-not ($inTgt_hst -or $inTgt_hop -or $inTgt_tgt)) {
     $cntDropped++
     if ($EnableCompareLog -and $lineBudget -gt 0) {
-      Log-Line ("cmp-drop: no match (host={0}, hop={1}, target={2})" -f $hstKey,$hopKey,$tgtKey)
+      Log-Line ("cmp-drop: no target match (host={0}, hop={1}, target={2})" -f $hstKey,$hopKey,$tgtKey)
       $lineBudget = $lineBudget - 1
     }
     continue
@@ -213,47 +209,67 @@ foreach($q in $teams){
     else { $displayKey = $hopKey; $pickSrc = "fallback(empty-host)" }
   }
 
-  # 採用role/label/segment: host→target→hop の順
+  # node_roles から役割/ラベル/セグメントを決定（host → target → hop）
   $matchRole=$null; $matchLabel=$null; $segmentVal=""
-  if ($roleByKey.ContainsKey($hstKey)) {
-    $matchRole  = $roleByKey[$hstKey]
-    if ($labelByKey.ContainsKey($hstKey)) { $matchLabel = $labelByKey[$hstKey] }
-    if ($segmentByNode.ContainsKey($hstKey)) { $segmentVal = $segmentByNode[$hstKey] }
-    $cntMatchHost++
-  } elseif ($roleByKey.ContainsKey($tgtKey)) {
-    $matchRole  = $roleByKey[$tgtKey]
-    if ($labelByKey.ContainsKey($tgtKey)) { $matchLabel = $labelByKey[$tgtKey] }
-    if ($segmentByNode.ContainsKey($tgtKey)) { $segmentVal = $segmentByNode[$tgtKey] }
-    $cntMatchTarget++
-  } elseif ($roleByKey.ContainsKey($hopKey)) {
-    $matchRole  = $roleByKey[$hopKey]
-    if ($labelByKey.ContainsKey($hopKey)) { $matchLabel = $labelByKey[$hopKey] }
-    if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
-    $cntMatchHop++
-  } else {
-    if ($segmentByNode.ContainsKey($displayKey)) { $segmentVal = $segmentByNode[$displayKey] }
+
+  $nrHost   = $null; if ($roleByNode.ContainsKey($hstKey)) { $nrHost = $roleByNode[$hstKey] }
+  $nrTarget = $null; if ($roleByNode.ContainsKey($tgtKey)) { $nrTarget = $roleByNode[$tgtKey] }
+  $nrHop    = $null; if ($roleByNode.ContainsKey($hopKey)) { $nrHop = $roleByNode[$hopKey] }
+
+  if ($EnableCompareLog -and $lineBudget -gt 0) {
+    Log-Line ("nr-candidates: host={0} role={1} | target={2} role={3} | hop={4} role={5}" -f `
+      $hstKey,($(if ($null -ne $nrHost){$nrHost}else{""})), `
+      $tgtKey,($(if ($null -ne $nrTarget){$nrTarget}else{""})), `
+      $hopKey,($(if ($null -ne $nrHop){$nrHop}else{""})))
+    $lineBudget = $lineBudget - 1
   }
+
+  if ($roleByNode.ContainsKey($displayKey)) {
+    $matchRole  = $roleByNode[$displayKey]
+    if ($labelByNode.ContainsKey($displayKey)) { $matchLabel = $labelByNode[$displayKey] }
+    if ($segmentByNode.ContainsKey($displayKey)) { $segmentVal = $segmentByNode[$displayKey] }
+    if ($displayKey -eq $hstKey) { $cntRoleFromHostNR++ }
+    elseif ($displayKey -eq $tgtKey) { $cntRoleFromTargetNR++ }
+    else { $cntRoleFromHopNR++ }
+  } else {
+    if ($roleByNode.ContainsKey($hstKey)) {
+      $matchRole  = $roleByNode[$hstKey]
+      if ($labelByNode.ContainsKey($hstKey)) { $matchLabel = $labelByNode[$hstKey] }
+      if ($segmentByNode.ContainsKey($hstKey)) { $segmentVal = $segmentByNode[$hstKey] }
+      $cntRoleFromHostNR++
+    } elseif ($roleByNode.ContainsKey($tgtKey)) {
+      $matchRole  = $roleByNode[$tgtKey]
+      if ($labelByNode.ContainsKey($tgtKey)) { $matchLabel = $labelByNode[$tgtKey] }
+      if ($segmentByNode.ContainsKey($tgtKey)) { $segmentVal = $segmentByNode[$tgtKey] }
+      $cntRoleFromTargetNR++
+    } elseif ($roleByNode.ContainsKey($hopKey)) {
+      $matchRole  = $roleByNode[$hopKey]
+      if ($labelByNode.ContainsKey($hopKey)) { $matchLabel = $labelByNode[$hopKey] }
+      if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
+      $cntRoleFromHopNR++
+    }
+  }
+
   if ([string]::IsNullOrWhiteSpace($matchRole))  { $matchRole  = "Uncategorized" }
   if ([string]::IsNullOrWhiteSpace($matchLabel)) { $matchLabel = $displayKey }
 
   $cntAdoptHost++
   if ($EnableCompareLog -and $lineBudget -gt 0) {
-    Log-Line ("cmp-pick: displayKey={0} src={1} role={2} label={3}" -f $displayKey,$pickSrc,$matchRole,$matchLabel)
+    Log-Line ("cmp-pick: displayKey={0} src={1} role(node_roles)={2} label={3} seg={4}" -f $displayKey,$pickSrc,$matchRole,$matchLabel,$segmentVal)
     $lineBudget = $lineBudget - 1
   }
 
   # floors: BSSID → area/floor/tag + AP
   $bNorm = Normalize-Bssid $q.bssid
   $areaVal = "Unknown"; $floorVal = $null; $tagVal = $null
-  $bssidStatus = ""
-  if ($null -eq $bNorm) { $cntFloorMissEmpty++; $bssidStatus="bssid=EMPTY" }
+  if ($null -eq $bNorm) { $cntFloorMissEmpty++ }
   else {
     if ($areaByBssid.ContainsKey($bNorm)) {
       $areaVal = $areaByBssid[$bNorm]
       if ($floorByBssid.ContainsKey($bNorm)) { $floorVal = $floorByBssid[$bNorm] }
       if ($tagByBssid.ContainsKey($bNorm))   { $tagVal   = $tagByBssid[$bNorm] }
-      $cntFloorHitExact++; $bssidStatus="bssid=HIT"
-    } else { $cntFloorMissNotFound++; $bssidStatus="bssid=NOTFOUND" }
+      $cntFloorHitExact++
+    } else { $cntFloorMissNotFound++ }
   }
 
   # AP名解決
@@ -266,46 +282,49 @@ foreach($q in $teams){
   else { $apLabel = "(AP unknown)"; $cntApUnknown++ }
   $apKey = $null; if ($null -ne $bNorm) { $apKey = $bNorm } else { $apKey = Safe-Lower $apLabel }
 
-  # 数値系：採用roleが SAAS なら http_head_ms、他は icmp_avg_ms
+  # メトリクス：役割=SAAS のとき http_head_ms、その他は icmp_avg_ms
   $rtt  = Parse-Double $q.icmp_avg_ms
   $http = Parse-Double $q.http_head_ms
   $roleNorm = $matchRole.ToString().Trim().ToUpper()
   $metric = $null; $metricKind = "RTT"
-  if ($roleNorm -eq "SAAS") { if ($null -ne $http) { $metric = $http; $metricKind = "HTTP" } else { $metric = $rtt; $metricKind = "RTT" } }
-  else { $metric = $rtt; $metricKind = "RTT" }
+  if ($roleNorm -eq "SAAS") {
+    if ($null -ne $http) { $metric = $http; $metricKind = "HTTP" }
+    else { $metric = $rtt; $metricKind = "RTT" }
+  } else { $metric = $rtt; $metricKind = "RTT" }
   $jit  = Parse-Double $q.icmp_jitter_ms
   $loss = Parse-Double $q.loss_pct
   $mos  = Parse-Double $q.mos_estimate
-  if ($null -eq $mos -and $null -ne $rtt -and $null -ne $loss) { $mos = [math]::Round((4.5 - 0.0004*[double]$rtt - 0.1*[double]$loss),2) }
+  if ($null -eq $mos -and $null -ne $rtt -and $null -ne $loss) {
+    $mos = [math]::Round((4.5 - 0.0004*[double]$rtt - 0.1*[double]$loss),2)
+  }
 
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     $lbssid = $null
     if ($null -eq $bNorm) { $lbssid = "(empty)" } else { $lbssid = $bNorm }
-    Log-Line ("cmp-metric: key={0} role={1} kind={2} value={3} bssid={4} area={5} ap={6}" -f $displayKey,$roleNorm,$metricKind,$metric,$lbssid,$areaVal,$apLabel)
+    Log-Line ("metric: key={0} role={1} kind={2} value={3} bssid={4} area={5} ap={6}" -f $displayKey,$roleNorm,$metricKind,$metric,$lbssid,$areaVal,$apLabel)
     $lineBudget = $lineBudget - 1
   }
 
-  $obj = [PSCustomObject]@{
-    timestamp = $q.timestamp
-    target    = $displayKey
-    role      = $matchRole
-    label     = $matchLabel
-    segment   = $segmentVal
-    metric_ms = $metric
-    metric_kind = $metricKind
-    rtt_ms    = $rtt
-    jitter_ms = $jit
-    loss_pct  = $loss
-    mos       = $mos
-    ssid      = $q.ssid
-    bssid     = $bNorm
-    ap_key    = $apKey
-    ap_label  = $apLabel
-    area      = $areaVal
-    floor     = $floorVal
-    ap_tag    = $tagVal
+  $qual += [PSCustomObject]@{
+    timestamp  = $q.timestamp
+    target     = $displayKey
+    role       = $matchRole
+    label      = $matchLabel
+    segment    = $segmentVal
+    metric_ms  = $metric
+    metric_kind= $metricKind
+    rtt_ms     = $rtt
+    jitter_ms  = $jit
+    loss_pct   = $loss
+    mos        = $mos
+    ssid       = $q.ssid
+    bssid      = $bNorm
+    ap_key     = $apKey
+    ap_label   = $apLabel
+    area       = $areaVal
+    floor      = $floorVal
+    ap_tag     = $tagVal
   }
-  $qual += $obj
 }
 
 # ===== 明細（グラフ用） =====
@@ -359,12 +378,12 @@ $detailsOrdered = [ordered]@{}
 foreach($k in $detailMap.Keys){ $detailsOrdered[$k] = $detailMap[$k] }
 $detailsJson = ($detailsOrdered | ConvertTo-Json -Depth 6)
 
-# ===== HTML =====
+# ===== HTML（グラフは縦軸0–300ms固定、100ms赤破線、1h補助線付き）=====
 $htmlTemplate = @'
 <!doctype html>
 <html lang="ja"><head>
 <meta charset="utf-8" />
-<title>NetQuality Report (クリック展開＋ソート)</title>
+<title>NetQuality Report (node_roles基準)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; margin: 16px; }
@@ -384,7 +403,7 @@ $htmlTemplate = @'
   .sort-ind{margin-left:6px; opacity:.6;}
 </style>
 </head><body>
-  <h1>ネットワーク品質レポート（targets一致ならhost採用／クリック展開＆ヘッダーソート）</h1>
+  <h1>ネットワーク品質レポート（targetsで絞込み／役割はnode_rolesで判定）</h1>
 
   <div class="filters">
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
@@ -535,7 +554,7 @@ function drawLineChart(canvas, points){
     ctx.fillText(label, xx, H-22);
   }
 
-  // 折れ線（データはクリップ）
+  // 折れ線
   ctx.beginPath();
   var first=true, worstV=-Infinity, worstX=0, worstY=0;
   for(var i=0;i<points.length;i++){
@@ -558,20 +577,6 @@ function drawLineChart(canvas, points){
   ctx.textAlign="right";
   ctx.fillText(new Date(maxT).toLocaleString(), W-10, H-16);
 }
-
-var sortKey=null, sortAsc=true;
-function setSortIndicator(){
-  var ths=document.querySelectorAll('thead th');
-  for(var i=0;i<ths.length;i++){
-    var th=ths[i]; var span=th.querySelector('.sort-ind');
-    if(!span) continue;
-    var k=th.getAttribute('data-sort');
-    if(k && k===sortKey){ span.textContent = sortAsc ? "▲" : "▼"; }
-    else { span.textContent=""; }
-  }
-}
-
-var tableBody=document.querySelector('#sumTbl tbody');
 
 function render(){
   var area=areaSel.value||"",ap=apSel.value||"",role=roleSel.value||"",seg=segSel.value||"",q=(qInput.value||"").toLowerCase();
@@ -653,6 +658,7 @@ function render(){
 render();
 
 // ヘッダークリックでソート
+var sortKey=null, sortAsc=true;
 var ths=document.querySelectorAll('thead th[data-sort]');
 for(var i=0;i<ths.length;i++){
   ths[i].addEventListener('click',function(){
@@ -667,6 +673,7 @@ for(var i=0;i<ths.length;i++){
 
 $html = $htmlTemplate.Replace('__SUMMARY_JSON__', $summaryJson).Replace('__DETAILS_JSON__', $detailsJson)
 
+# ===== 出力 (UTF-8 BOM) =====
 try {
   $fullPath = [System.IO.Path]::GetFullPath($OutHtml)
   $dir = [System.IO.Path]::GetDirectoryName($fullPath)
@@ -681,7 +688,7 @@ try {
   Write-Warning "WriteAllText に失敗したため Out-File で出力しました。"
 }
 
-# 参考メトリクス
+# ===== 参考メトリクス =====
 $total = $teams.Count
 $after = $qual.Count
 $mappedArea = ($qual | Where-Object { $_.area -ne "Unknown" }).Count
@@ -689,8 +696,8 @@ if ($total -gt 0) {
   $pctUsed = [math]::Round(100.0 * $after / $total, 1)
   $pctArea = 0.0
   if ($after -gt 0) { $pctArea = [math]::Round(100.0 * $mappedArea / $after, 1) }
-  $summary = ("teams行数: {0}, 採用行数: {1} ({2}%) | area付与率: {3}% ({4}/{5}) | match(host/target/hop) host={6} target={7} hop={8} | host採用行={9} | floors: HIT={10} / EMPTY={11} / NOTFOUND={12} | AP解決: teams={13} floors={14} bssid={15} unknown={16}" -f `
-    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntMatchHost,$cntMatchTarget,$cntMatchHop,$cntAdoptHost,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound,$cntApFromTeams,$cntApFromFloors,$cntApFromBssid,$cntApUnknown)
+  $summary = ("teams行数: {0}, 採用行数: {1} ({2}%) | area付与率: {3}% ({4}/{5}) | role(from node_roles): host={6}, target={7}, hop={8} | host採用行={9} | floors: HIT={10} / EMPTY={11} / NOTFOUND={12} | AP解決: teams={13} floors={14} bssid={15} unknown={16}" -f `
+    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntRoleFromHostNR,$cntRoleFromTargetNR,$cntRoleFromHopNR,$cntAdoptHost,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound,$cntApFromTeams,$cntApFromFloors,$cntApFromBssid,$cntApUnknown)
   Write-Output $summary
   Log-Line $summary
 }
