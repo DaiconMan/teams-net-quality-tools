@@ -5,16 +5,16 @@
     * targets.csv（UTF-8） … ヘッダー: role,key,label
     * node_roles.csv（UTF-8, 任意） … ヘッダー: ip_of_host,role,label,segment
     * floors.csv（UTF-8） … ヘッダー: bssid,area,floor,tag,(任意: ap / ap_name)
-  - 仕様
-    * 宛先: hop_ip を最優先 → なければ target を targets.key と照合。一致しない行は除外
-    * area/floor/tag: teams.bssid ↔ floors.bssid の完全一致のみ（targets は無関与）
+  - 主要仕様（今回のポイント）
+    * フィルタ採用条件: host / hop_ip / target のいずれかが targets.key に一致した行のみ採用
+    * 表示キー: 採用された行は **常に teams_net_quality.csv の host を採用**（host空欄時のみフォールバック）
+    * role/label: host→target→hop の順で targets から付与、なければ node_roles で補完
+    * SAAS 集計: 採用role=SAAS の行は http_head_ms、それ以外は icmp_avg_ms を使用
+    * area/floor/tag: teams.bssid ↔ floors.bssid のみで付与（targets は無関与）
     * AP表示: teams.ap_name → floors.(ap|ap_name) → BSSIDラベル
-    * 集計メトリクス: 役割が SAAS の行は http_head_ms、それ以外は icmp_avg_ms（= RTT）
-    * UI: 行クリックで詳細行が展開し、該当グループの時系列ミニグラフを描画
-          表示列に「最悪時間帯」を追加（時系列から時間帯[0-23時]を算出）
-  - ログ: -EnableCompareLog で比較ログを出力（既存機能）
-  - 出力: HTML 単一ファイル（UTF-8 BOM, 外部ライブラリ不要）
-  - 注意: 三項演算子( ?: )不使用 / $Host未使用 / OneDrive・日本語パス対応
+    * UI: 行クリックで詳細折りたたみ＋時系列ミニグラフ、最悪時間帯（0–23時平均で最大の時間帯）を表示
+  - ログ: -EnableCompareLog で比較ログ（候補/採用/ドロップ/メトリクス）を出力
+  - 注意: 三項演算子( ?: )不使用 / $Host未使用 / UTF-8 BOM 出力 / OneDrive・日本語パス対応
 #>
 
 [CmdletBinding()]
@@ -164,9 +164,10 @@ foreach($f in $floors){
   if (-not (Is-BlankOrUnknown $apCandidate)) { $apByBssid[$b] = $apCandidate }
 }
 
-# ===== 正規化 & マッチング（hop_ip → target）=====
+# ===== 正規化 & マッチング（「一致していれば host 採用」ルール）=====
 $qual = @()
-$cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
+$cntAdoptHost = 0
+$cntMatchHost = 0; $cntMatchHop = 0; $cntMatchTarget = 0; $cntDropped = 0
 $cntFloorHitExact = 0; $cntFloorMissEmpty = 0; $cntFloorMissNotFound = 0
 $cntApFromTeams=0; $cntApFromFloors=0; $cntApFromBssid=0; $cntApUnknown=0
 $lineBudget = $MaxCompareLogLines; if ($lineBudget -lt 0) { $lineBudget = 0 }
@@ -174,28 +175,78 @@ $lineBudget = $MaxCompareLogLines; if ($lineBudget -lt 0) { $lineBudget = 0 }
 foreach($q in $teams){
   $hopKey = Safe-Lower $q.hop_ip
   $tgtKey = Safe-Lower $q.target
-  $matchKey=$null; $matchRole=$null; $matchLabel=$null; $segmentVal=""
+  $hstKey = Safe-Lower $q.host
 
-  if (-not [string]::IsNullOrWhiteSpace($hopKey) -and $targetSet.ContainsKey($hopKey)) {
-    $matchKey = $hopKey
-    if ($roleByKey.ContainsKey($hopKey))  { $matchRole  = $roleByKey[$hopKey] }
-    if ($labelByKey.ContainsKey($hopKey)) { $matchLabel = $labelByKey[$hopKey] }
-    if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
-    $cntMatchHop++
-  } elseif (-not [string]::IsNullOrWhiteSpace($tgtKey) -and $targetSet.ContainsKey($tgtKey)) {
-    $matchKey = $tgtKey
-    if ($roleByKey.ContainsKey($tgtKey))  { $matchRole  = $roleByKey[$tgtKey] }
+  $inTgt_hst = $false
+  $inTgt_hop = $false
+  $inTgt_tgt = $false
+  if (-not [string]::IsNullOrWhiteSpace($hstKey)) { if ($targetSet.ContainsKey($hstKey)) { $inTgt_hst = $true } }
+  if (-not [string]::IsNullOrWhiteSpace($hopKey)) { if ($targetSet.ContainsKey($hopKey)) { $inTgt_hop = $true } }
+  if (-not [string]::IsNullOrWhiteSpace($tgtKey)) { if ($targetSet.ContainsKey($tgtKey)) { $inTgt_tgt = $true } }
+
+  # 候補ロールの取得
+  $roleHst = $null; if ($roleByKey.ContainsKey($hstKey)) { $roleHst = $roleByKey[$hstKey] }
+  $roleHop = $null; if ($roleByKey.ContainsKey($hopKey)) { $roleHop = $roleByKey[$hopKey] }
+  $roleTgt = $null; if ($roleByKey.ContainsKey($tgtKey)) { $roleTgt = $roleByKey[$tgtKey] }
+
+  # 比較ログ: 候補一覧
+  if ($EnableCompareLog -and $lineBudget -gt 0) {
+    Log-Line ("cmp-candidates: host={0} in={1} role={2} | hop={3} in={4} role={5} | target={6} in={7} role={8}" -f `
+      $hstKey, $inTgt_hst, ($(if ($null -ne $roleHst){$roleHst}else{""})), `
+      $hopKey, $inTgt_hop, ($(if ($null -ne $roleHop){$roleHop}else{""})), `
+      $tgtKey, $inTgt_tgt, ($(if ($null -ne $roleTgt){$roleTgt}else{""})))
+    $lineBudget = $lineBudget - 1
+  }
+
+  # いずれか一致すれば採用、表示キーは host（host空欄時のみフォールバック）
+  $anyMatch = $inTgt_hst -or $inTgt_hop -or $inTgt_tgt
+  if (-not $anyMatch) {
+    $cntDropped++
+    if ($EnableCompareLog -and $lineBudget -gt 0) {
+      Log-Line ("cmp-drop: no match (host={0}, hop={1}, target={2})" -f $hstKey,$hopKey,$tgtKey)
+      $lineBudget = $lineBudget - 1
+    }
+    continue
+  }
+
+  $displayKey = $hstKey
+  $pickSrc = "host"
+  if ([string]::IsNullOrWhiteSpace($displayKey)) {
+    if ($inTgt_hop) { $displayKey = $hopKey; $pickSrc = "hop(fallback)" }
+    elseif ($inTgt_tgt) { $displayKey = $tgtKey; $pickSrc = "target(fallback)" }
+    else { $displayKey = $hopKey; $pickSrc = "fallback(empty-host)" }
+  }
+
+  # 採用role/label/segment の決定: host→target→hop の順
+  $matchRole=$null; $matchLabel=$null; $segmentVal=""
+  if ($roleByKey.ContainsKey($hstKey)) {
+    $matchRole  = $roleByKey[$hstKey]
+    if ($labelByKey.ContainsKey($hstKey)) { $matchLabel = $labelByKey[$hstKey] }
+    if ($segmentByNode.ContainsKey($hstKey)) { $segmentVal = $segmentByNode[$hstKey] }
+    $cntMatchHost++
+  } elseif ($roleByKey.ContainsKey($tgtKey)) {
+    $matchRole  = $roleByKey[$tgtKey]
     if ($labelByKey.ContainsKey($tgtKey)) { $matchLabel = $labelByKey[$tgtKey] }
     if ($segmentByNode.ContainsKey($tgtKey)) { $segmentVal = $segmentByNode[$tgtKey] }
     $cntMatchTarget++
+  } elseif ($roleByKey.ContainsKey($hopKey)) {
+    $matchRole  = $roleByKey[$hopKey]
+    if ($labelByKey.ContainsKey($hopKey)) { $matchLabel = $labelByKey[$hopKey] }
+    if ($segmentByNode.ContainsKey($hopKey)) { $segmentVal = $segmentByNode[$hopKey] }
+    $cntMatchHop++
   } else {
-    $cntDropped++; continue
+    # 役割未設定のまま（targetsにrole無し）→ node_rolesで補完
+    if ($segmentByNode.ContainsKey($displayKey)) { $segmentVal = $segmentByNode[$displayKey] }
   }
-
-  if ([string]::IsNullOrWhiteSpace($matchRole) -and $roleByNode.ContainsKey($matchKey))  { $matchRole  = $roleByNode[$matchKey] }
-  if ([string]::IsNullOrWhiteSpace($matchLabel) -and $labelByNode.ContainsKey($matchKey)){ $matchLabel = $labelByNode[$matchKey] }
   if ([string]::IsNullOrWhiteSpace($matchRole))  { $matchRole  = "Uncategorized" }
-  if ([string]::IsNullOrWhiteSpace($matchLabel)) { $matchLabel = $matchKey }
+  if ([string]::IsNullOrWhiteSpace($matchLabel)) { $matchLabel = $displayKey }
+
+  $cntAdoptHost++
+
+  if ($EnableCompareLog -and $lineBudget -gt 0) {
+    Log-Line ("cmp-pick: displayKey={0} src={1} role={2} label={3}" -f $displayKey,$pickSrc,$matchRole,$matchLabel)
+    $lineBudget = $lineBudget - 1
+  }
 
   # floors: BSSID → area/floor/tag + AP
   $bNorm = Normalize-Bssid $q.bssid
@@ -221,11 +272,12 @@ foreach($q in $teams){
   else { $apLabel = "(AP unknown)"; $cntApUnknown++ }
   $apKey = $null; if ($null -ne $bNorm) { $apKey = $bNorm } else { $apKey = Safe-Lower $apLabel }
 
-  # 数値系：SAASは http_head_ms、その他は icmp_avg_ms
+  # 数値系：採用roleが SAAS なら http_head_ms、他は icmp_avg_ms
   $rtt  = Parse-Double $q.icmp_avg_ms
   $http = Parse-Double $q.http_head_ms
+  $roleNorm = $matchRole.ToString().Trim().ToUpper()
   $metric = $null; $metricKind = "RTT"
-  if ($matchRole -eq "SAAS") {
+  if ($roleNorm -eq "SAAS") {
     if ($null -ne $http) { $metric = $http; $metricKind = "HTTP" }
     else { $metric = $rtt; $metricKind = "RTT" }
   } else { $metric = $rtt; $metricKind = "RTT" }
@@ -238,14 +290,13 @@ foreach($q in $teams){
 
   if ($EnableCompareLog -and $lineBudget -gt 0) {
     $lbssid = if ($null -eq $bNorm) { "(empty)" } else { $bNorm }
-    $mby = "hop"; if ($matchKey -eq $tgtKey) { $mby = "target" }
-    Log-Line ("match={0} key={1} bssid={2} floors={3} area={4} apLabel={5} metric={6} value={7}" -f $mby,$matchKey,$lbssid,$bssidStatus,$areaVal,$apLabel,$metricKind,$metric)
+    Log-Line ("cmp-metric: key={0} role={1} kind={2} value={3} bssid={4} area={5} ap={6}" -f $displayKey,$roleNorm,$metricKind,$metric,$lbssid,$areaVal,$apLabel)
     $lineBudget = $lineBudget - 1
   }
 
   $obj = [PSCustomObject]@{
     timestamp = $q.timestamp
-    target    = $matchKey
+    target    = $displayKey   # ← 一致していれば常に host を表示キーに採用
     role      = $matchRole
     label     = $matchLabel
     segment   = $segmentVal
@@ -271,7 +322,6 @@ foreach($q in $teams){
 }
 
 # ===== 明細（グラフ用）をグループキーごとに保持 =====
-# グループキー: area|ap_key|target|role|segment
 $detailMap = @{}
 foreach($o in $qual){
   $gk = ('{0}|{1}|{2}|{3}|{4}' -f $o.area, $o.ap_key, $o.target, $o.role, $o.segment)
@@ -318,12 +368,8 @@ foreach($g in $groups){
 
 # ===== JSON 生成 =====
 $summaryJson = $summaryRows | ConvertTo-Json -Depth 6
-
-# details は { "gkey": [ {ts:"...", v:123}, ... ], ... } の形にする
 $detailsOrdered = [ordered]@{}
-foreach($k in $detailMap.Keys){
-  $detailsOrdered[$k] = $detailMap[$k]
-}
+foreach($k in $detailMap.Keys){ $detailsOrdered[$k] = $detailMap[$k] }
 $detailsJson = ($detailsOrdered | ConvertTo-Json -Depth 6)
 
 # ===== HTML（@'…'@ + JSON置換, UTF-8 BOM出力）=====
@@ -350,7 +396,7 @@ $htmlTemplate = @'
   .meta { font-size:12px; color:#444; margin:4px 0 0; }
 </style>
 </head><body>
-  <h1>ネットワーク品質レポート（targets × hop_ip優先／SAAS=HTTP集計／行クリックで詳細グラフ）</h1>
+  <h1>ネットワーク品質レポート（targets一致ならhost採用／行クリックで詳細グラフ）</h1>
 
   <div class="filters">
     <select id="areaSel"><option value="">(すべてのエリア)</option></select>
@@ -389,18 +435,15 @@ fillSel(segSel,uniq(summaryRows.map(function(r){return r.segment;})));
 
 function colorResp(td,v){if(v==null)return;if(v<50)td.classList.add('rt-ok');else if(v<100)td.classList.add('rt-warn');else td.classList.add('rt-bad');}
 function colorLoss(td,v){if(v!=null&&v>3)td.classList.add('loss-bad');}
-
 function hourString(h){ return (h<10?("0"+h):h) + "時台"; }
 
 function worstHour(points){
   if(!points||points.length===0) return "";
-  // 0-23時の平均値で最悪時間帯を求める
-  var buckets = new Array(24); var counts = new Array(24);
+  var buckets = new Array(24), counts = new Array(24);
   for(var i=0;i<24;i++){ buckets[i]=0; counts[i]=0; }
   for(var i=0;i<points.length;i++){
     var t = new Date(points[i].ts); if(isNaN(t)) continue;
-    var h = t.getHours();
-    var v = points[i].v; if(v==null) continue;
+    var h = t.getHours(); var v = points[i].v; if(v==null) continue;
     buckets[h]+=v; counts[h]++;
   }
   var worst=-1, wh=-1;
@@ -419,7 +462,6 @@ function drawLineChart(canvas, points){
   ctx.clearRect(0,0,W,H);
   if(!points || points.length===0){ ctx.fillText("データなし",10,14); return; }
 
-  // スケール計算
   var minT=Infinity, maxT=-Infinity, minV=Infinity, maxV=-Infinity;
   for(var i=0;i<points.length;i++){
     var t = new Date(points[i].ts).getTime(); if(isNaN(t)) continue;
@@ -434,16 +476,13 @@ function drawLineChart(canvas, points){
   function x(t){ return padL + ( (t-minT)/(maxT-minT) ) * (W-padL-padR); }
   function y(v){ return H-padB - ( (v-minV)/(maxV-minV) ) * (H-padT-padB); }
 
-  // 軸
   ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, H-padB); ctx.lineTo(W-padR, H-padB); ctx.stroke();
 
-  // 目盛（Yのみ簡易）
   ctx.font="12px sans-serif"; ctx.textAlign="right"; ctx.textBaseline="middle";
   var ticks=4; for(var i=0;i<=ticks;i++){ var vv=minV+(maxV-minV)*i/ticks; var yy=y(vv);
     ctx.fillText(vv.toFixed(0), padL-6, yy); ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.strokeStyle="rgba(0,0,0,0.06)"; ctx.stroke(); ctx.strokeStyle="black";
   }
 
-  // 折れ線
   ctx.beginPath();
   var first=true, worstV=-Infinity, worstX=0, worstY=0;
   for(var i=0;i<points.length;i++){
@@ -455,10 +494,8 @@ function drawLineChart(canvas, points){
   }
   ctx.stroke();
 
-  // 最大点
   ctx.beginPath(); ctx.arc(worstX,worstY,3,0,6.283); ctx.fill();
 
-  // Xラベル（左右端）
   ctx.textAlign="left"; ctx.textBaseline="top";
   var minD=new Date(minT), maxD=new Date(maxT);
   ctx.fillText(minD.toLocaleString(), padL, H-20);
@@ -486,7 +523,6 @@ function render(){
     var pts = detailsMap[r.gkey] || [];
     var wh = worstHour(pts);
 
-    // メイン行
     var tr=document.createElement('tr'); tr.className="main"; tr.dataset.gkey=r.gkey;
     function td(t){var e=document.createElement('td'); e.textContent=(t==null?"":t); return e;}
     tr.appendChild(td(r.area));
@@ -502,17 +538,15 @@ function render(){
     tr.appendChild(td(r.mos_med));
     tr.appendChild(td(wh));
 
-    // 詳細行（最初は折りたたみ）
     var dtr=document.createElement('tr'); dtr.className="detail"; dtr.style.display="none";
     var tdwrap=document.createElement('td'); tdwrap.colSpan=12;
     var div=document.createElement('div'); div.className="canvaswrap";
     var canvas=document.createElement('canvas'); canvas.width=tdwrap.clientWidth||800; canvas.height=180;
     div.appendChild(canvas);
     var meta=document.createElement('div'); meta.className="meta";
-    meta.textContent="クリックで開閉／縦軸=ms（SAASはHTTPヘッダ遅延、それ以外はICMP RTT）";
+    meta.textContent="クリックで開閉／縦軸=ms（role=SAAS はHTTPヘッダ遅延、それ以外はICMP RTT）";
     tdwrap.appendChild(div); tdwrap.appendChild(meta); dtr.appendChild(tdwrap);
 
-    // クリックで開閉＆描画
     tr.addEventListener('click', function(trRef,dtrRef,cvRef,points){
       return function(){
         if(dtrRef.style.display==="none"){ dtrRef.style.display="table-row"; drawLineChart(cvRef, points); }
@@ -553,8 +587,8 @@ if ($total -gt 0) {
   $pctUsed = [math]::Round(100.0 * $after / $total, 1)
   $pctArea = 0.0
   if ($after -gt 0) { $pctArea = [math]::Round(100.0 * $mappedArea / $after, 1) }
-  $summary = ("teams行数: {0}, 採用行数: {1} ({2}%) | area付与率: {3}% ({4}/{5}) | hop一致: {6} / target一致: {7} / 除外: {8} | floors: HIT={9} / EMPTY={10} / NOTFOUND={11} | AP解決: teams={12} floors={13} bssid={14} unknown={15}" -f `
-    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntMatchHop,$cntMatchTarget,$cntDropped,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound,$cntApFromTeams,$cntApFromFloors,$cntApFromBssid,$cntApUnknown)
+  $summary = ("teams行数: {0}, 採用行数: {1} ({2}%) | area付与率: {3}% ({4}/{5}) | match(host/target/hop) host={6} target={7} hop={8} | host採用行={9} | floors: HIT={10} / EMPTY={11} / NOTFOUND={12} | AP解決: teams={13} floors={14} bssid={15} unknown={16}" -f `
+    $total,$after,$pctUsed,$pctArea,$mappedArea,$after,$cntMatchHost,$cntMatchTarget,$cntMatchHop,$cntAdoptHost,$cntFloorHitExact,$cntFloorMissEmpty,$cntFloorMissNotFound,$cntApFromTeams,$cntApFromFloors,$cntApFromBssid,$cntApUnknown)
   Write-Output $summary
   Log-Line $summary
 }
