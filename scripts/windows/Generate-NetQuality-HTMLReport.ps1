@@ -17,6 +17,7 @@
         - 「最悪時間帯」列: 0–23時の平均で最悪な時間帯を求め、その時間帯内の最悪値も併記（例 15時台 (183 ms)）
         - ヘッダークリックでソート（トグル）
         - P95ヘッダーに解説ツールチップ
+        - 【今回追加】縦軸0–300ms固定／100ms赤破線／1時間ごとの縦の補助線＋HH:00ラベル
   - ログ: -EnableCompareLog で候補/採用/ドロップ/メトリクスを出力
   - 注意: 三項演算子( ?: )不使用 / $Host未使用 / UTF-8 BOM 出力 / OneDrive・日本語パス対応
 #>
@@ -278,7 +279,8 @@ foreach($q in $teams){
   if ($null -eq $mos -and $null -ne $rtt -and $null -ne $loss) { $mos = [math]::Round((4.5 - 0.0004*[double]$rtt - 0.1*[double]$loss),2) }
 
   if ($EnableCompareLog -and $lineBudget -gt 0) {
-    $lbssid = if ($null -eq $bNorm) { "(empty)" } else { $bNorm }
+    $lbssid = $null
+    if ($null -eq $bNorm) { $lbssid = "(empty)" } else { $lbssid = $bNorm }
     Log-Line ("cmp-metric: key={0} role={1} kind={2} value={3} bssid={4} area={5} ap={6}" -f $displayKey,$roleNorm,$metricKind,$metric,$lbssid,$areaVal,$apLabel)
     $lineBudget = $lineBudget - 1
   }
@@ -362,7 +364,7 @@ $htmlTemplate = @'
 <!doctype html>
 <html lang="ja"><head>
 <meta charset="utf-8" />
-<title>NetQuality Report (クリック展開グラフ＋ソート)</title>
+<title>NetQuality Report (クリック展開＋ソート)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; margin: 16px; }
@@ -377,7 +379,7 @@ $htmlTemplate = @'
   .rt-ok{background:#e7f7e7;} .rt-warn{background:#fff5e0;} .rt-bad{background:#fdecec;} .loss-bad{background:#fdecec;}
   .muted{color:#777;}
   .hint{color:#666; font-size:12px;}
-  .canvaswrap{width:100%; height:180px;}
+  .canvaswrap{width:100%; height:200px;}
   .meta { font-size:12px; color:#444; margin:4px 0 0; }
   .sort-ind{margin-left:6px; opacity:.6;}
 </style>
@@ -454,7 +456,6 @@ function worstHourAndValue(points,gkey){
   }
   if(wh<0){ worstCache[gkey]=res; return res; }
 
-  // その時間帯に属するデータの中で最悪値
   var maxInHour=null;
   for(var i=0;i<points.length;i++){
     var t=new Date(points[i].ts); if(isNaN(t)) continue;
@@ -487,27 +488,54 @@ function drawLineChart(canvas, points){
   ctx.clearRect(0,0,W,H);
   if(!points || points.length===0){ ctx.fillText("データなし",10,14); return; }
 
-  var minT=Infinity, maxT=-Infinity, minV=Infinity, maxV=-Infinity;
+  // X範囲（データから）
+  var minT=Infinity, maxT=-Infinity;
+  var minV=0, maxV=300; // Y軸は固定 0–300 ms
   for(var i=0;i<points.length;i++){
     var t = new Date(points[i].ts).getTime(); if(isNaN(t)) continue;
-    var v = points[i].v; if(v==null) continue;
     if(t<minT)minT=t; if(t>maxT)maxT=t;
-    if(v<minV)minV=v; if(v>maxV)maxV=v;
   }
-  if(!isFinite(minT)||!isFinite(maxT)||minT===maxT){ minT=Date.now()-60000; maxT=Date.now(); }
-  if(!isFinite(minV)||!isFinite(maxV)||minV===maxV){ minV=0; maxV=(isFinite(points[0].v)?points[0].v:100); if(maxV<=0)maxV=100; }
+  if(!isFinite(minT)||!isFinite(maxT)||minT===maxT){ minT=Date.now()-3600000; maxT=Date.now(); }
 
-  var padL=40, padR=10, padT=10, padB=22;
+  var padL=45, padR=10, padT=10, padB=28;
   function x(t){ return padL + ( (t-minT)/(maxT-minT) ) * (W-padL-padR); }
-  function y(v){ return H-padB - ( (v-minV)/(maxV-minV) ) * (H-padT-padB); }
+  function y(v){
+    if(v<minV) v=minV; if(v>maxV) v=maxV;
+    return H-padB - ( (v-minV)/(maxV-minV) ) * (H-padT-padB);
+  }
 
+  // 軸
   ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, H-padB); ctx.lineTo(W-padR, H-padB); ctx.stroke();
 
+  // Y目盛（固定 0,100,200,300） + 100ms 赤破線
   ctx.font="12px sans-serif"; ctx.textAlign="right"; ctx.textBaseline="middle";
-  var ticks=4; for(var i=0;i<=ticks;i++){ var vv=minV+(maxV-minV)*i/ticks; var yy=y(vv);
-    ctx.fillText(vv.toFixed(0), padL-6, yy); ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy); ctx.strokeStyle="rgba(0,0,0,0.06)"; ctx.stroke(); ctx.strokeStyle="black";
+  var yTicks=[0,100,200,300];
+  for(var i=0;i<yTicks.length;i++){
+    var yy=y(yTicks[i]);
+    ctx.fillText(String(yTicks[i]), padL-6, yy);
+    ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(W-padR,yy);
+    if(yTicks[i]===100){ ctx.setLineDash([5,4]); ctx.strokeStyle="#d00"; }
+    else { ctx.setLineDash([2,4]); ctx.strokeStyle="rgba(0,0,0,0.10)"; }
+    ctx.stroke(); ctx.setLineDash([]); ctx.strokeStyle="black";
   }
 
+  // 1時間ごとの縦の補助線 + HH:00 ラベル
+  var start=new Date(minT); start.setMinutes(0,0,0);
+  if(start.getTime()>minT){ start=new Date(start.getTime()-3600000); }
+  var end=new Date(maxT); end.setMinutes(0,0,0);
+  if(end.getTime()<maxT){ end=new Date(end.getTime()+3600000); }
+  ctx.textAlign="center"; ctx.textBaseline="top";
+  for(var tt=start.getTime(); tt<=end.getTime(); tt+=3600000){
+    var xx=x(tt);
+    ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, H-padB);
+    ctx.setLineDash([2,4]); ctx.strokeStyle="rgba(0,0,0,0.10)"; ctx.stroke();
+    ctx.setLineDash([]); ctx.strokeStyle="black";
+    var hh=new Date(tt).getHours();
+    var label=(hh<10?("0"+hh):hh)+":00";
+    ctx.fillText(label, xx, H-22);
+  }
+
+  // 折れ線（データはクリップ）
   ctx.beginPath();
   var first=true, worstV=-Infinity, worstX=0, worstY=0;
   for(var i=0;i<points.length;i++){
@@ -519,14 +547,31 @@ function drawLineChart(canvas, points){
   }
   ctx.stroke();
 
-  ctx.beginPath(); ctx.arc(worstX,worstY,3,0,6.283); ctx.fill();
+  // 最大点
+  if(isFinite(worstX)&&isFinite(worstY)){
+    ctx.beginPath(); ctx.arc(worstX,worstY,3,0,6.283); ctx.fill();
+  }
 
+  // 左下に範囲の日時（最初と最後）
   ctx.textAlign="left"; ctx.textBaseline="top";
-  var minD=new Date(minT), maxD=new Date(maxT);
-  ctx.fillText(minD.toLocaleString(), padL, H-20);
+  ctx.fillText(new Date(minT).toLocaleString(), padL, H-16);
   ctx.textAlign="right";
-  ctx.fillText(maxD.toLocaleString(), W-10, H-20);
+  ctx.fillText(new Date(maxT).toLocaleString(), W-10, H-16);
 }
+
+var sortKey=null, sortAsc=true;
+function setSortIndicator(){
+  var ths=document.querySelectorAll('thead th');
+  for(var i=0;i<ths.length;i++){
+    var th=ths[i]; var span=th.querySelector('.sort-ind');
+    if(!span) continue;
+    var k=th.getAttribute('data-sort');
+    if(k && k===sortKey){ span.textContent = sortAsc ? "▲" : "▼"; }
+    else { span.textContent=""; }
+  }
+}
+
+var tableBody=document.querySelector('#sumTbl tbody');
 
 function render(){
   var area=areaSel.value||"",ap=apSel.value||"",role=roleSel.value||"",seg=segSel.value||"",q=(qInput.value||"").toLowerCase();
@@ -550,12 +595,10 @@ function render(){
       ka=(wa==null?-Infinity:wa); kb=(wb==null?-Infinity:wb);
     }else if(sortKey){
       ka=a[sortKey]; kb=b[sortKey];
-      // 数値は数値で比較
       var numKeys={"count":1,"resp_med":1,"resp_p95":1,"jit_med":1,"loss_avg":1,"mos_med":1};
       if(numKeys[sortKey]){ ka=(ka==null?-Infinity:ka); kb=(kb==null?-Infinity:kb); }
       else { ka=(ka||""); kb=(kb||""); }
     }else{
-      // デフォルト：エリア→AP→応答中央値(昇順)
       var keyA=(a.area||"")+"|"+(a.ap_label||""); var keyB=(b.area||"")+"|"+(b.ap_label||"");
       if(keyA<keyB) return -1; if(keyA>keyB) return 1;
       var ra=(a.resp_med!=null)?a.resp_med:1e12, rb=(b.resp_med!=null)?b.resp_med:1e12;
@@ -587,14 +630,13 @@ function render(){
     tr.appendChild(td(r.mos_med));
     tr.appendChild(td(wres.label));
 
-    // 詳細行
     var dtr=document.createElement('tr'); dtr.className="detail"; dtr.style.display="none";
     var tdwrap=document.createElement('td'); tdwrap.colSpan=12;
     var div=document.createElement('div'); div.className="canvaswrap";
-    var canvas=document.createElement('canvas'); canvas.width=tdwrap.clientWidth||800; canvas.height=180;
+    var canvas=document.createElement('canvas'); canvas.width=tdwrap.clientWidth||800; canvas.height=200;
     div.appendChild(canvas);
     var meta=document.createElement('div'); meta.className="meta";
-    meta.textContent="クリックで開閉／縦軸=ms（role=SAAS はHTTPヘッダ遅延、それ以外はICMP RTT）";
+    meta.textContent="クリックで開閉／縦軸固定0–300ms（100ms赤破線）／role=SAASはHTTPヘッダ遅延、それ以外はICMP RTT／縦線=1時間ごと";
     tdwrap.appendChild(div); tdwrap.appendChild(meta); dtr.appendChild(tdwrap);
 
     tr.addEventListener('click', function(dtrRef,cvRef,points){
