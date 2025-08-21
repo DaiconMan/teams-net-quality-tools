@@ -15,8 +15,8 @@
     * AP表示: teams.ap_name → floors.(ap|ap_name) → BSSIDラベル
     * HTML UI:
         - 行クリックで詳細グラフ
-        - グラフ: 縦軸0–300ms固定／100ms赤破線／毎時の縦補助線＋HH:00ラベル
-        - ★横軸0:00–24:00固定（時刻のみでプロット）＋データが無い区間は線を切る（30分以上の空白で分割）
+        - グラフ: 横軸0:00–24:00固定（データ無区間は線を非表示／30分空白で分割）
+                 縦軸0–300ms固定／100ms赤破線／縦の補助線=1時間ごと／時間ラベル=2時間ごと
         - 「最悪時間帯」列: 平均が最悪な時間帯＋その時間帯の最悪値(ms)
         - ヘッダークリックでソート（トグル）
         - P95ヘッダーに解説ツールチップ
@@ -376,7 +376,7 @@ $detailsOrdered = [ordered]@{}
 foreach($k in $detailMap.Keys){ $detailsOrdered[$k] = $detailMap[$k] }
 $detailsJson = ($detailsOrdered | ConvertTo-Json -Depth 6)
 
-# ===== HTML（グラフは横軸0–24h固定＆ギャップ非連結）=====
+# ===== HTML（グラフは横軸0–24h固定＆ギャップ非連結／縦線1h・ラベル2h）=====
 $htmlTemplate = @'
 <!doctype html>
 <html lang="ja"><head>
@@ -502,7 +502,6 @@ var tableBody=document.querySelector('#sumTbl tbody');
 // 0:00–24:00 表示用ヘルパ
 var DAY_MS = 24*60*60*1000;
 function toTodMs(d){
-  // ローカル時刻の時刻成分(ms)
   return d.getHours()*3600000 + d.getMinutes()*60000 + d.getSeconds()*1000 + d.getMilliseconds();
 }
 
@@ -537,15 +536,19 @@ function drawLineChart(canvas, points){
     ctx.stroke(); ctx.setLineDash([]); ctx.strokeStyle="black";
   }
 
-  // 1時間ごとの縦の補助線 + HH:00 ラベル（0:00〜24:00固定）
+  // 縦の補助線=1時間ごと、時間ラベル=2時間ごと
   ctx.textAlign="center"; ctx.textBaseline="top";
   for(var h=0; h<=24; h++){
     var xx=xFromTod(h*3600000);
+    // 補助線（毎時）
     ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, H-padB);
     ctx.setLineDash([2,4]); ctx.strokeStyle="rgba(0,0,0,0.10)"; ctx.stroke();
     ctx.setLineDash([]); ctx.strokeStyle="black";
-    var label=(h<10?("0"+h):h)+":00";
-    ctx.fillText(label, xx, H-22);
+    // ラベル（2時間ごと）
+    if(h%2===0){
+      var label=(h<10?("0"+h):h)+":00";
+      ctx.fillText(label, xx, H-22);
+    }
   }
 
   // 時刻配列に変換 & 時刻順にソート
@@ -568,7 +571,6 @@ function drawLineChart(canvas, points){
     var xx=xFromTod(tod), yy=y(vv);
 
     if(first || prevTod==null || (tod - prevTod) > GAP_MS){
-      // 新しいセグメントを開始
       if(!first){ ctx.stroke(); }
       ctx.beginPath(); ctx.moveTo(xx,yy);
       first=false;
@@ -585,12 +587,6 @@ function drawLineChart(canvas, points){
   if(isFinite(worstX)&&isFinite(worstY)){
     ctx.beginPath(); ctx.arc(worstX,worstY,3,0,6.283); ctx.fill();
   }
-
-  // 左下に固定ラベル
-  ctx.textAlign="left"; ctx.textBaseline="top";
-  ctx.fillText("00:00", padL, H-16);
-  ctx.textAlign="right";
-  ctx.fillText("24:00", W-10, H-16);
 }
 
 function render(){
@@ -629,7 +625,7 @@ function render(){
   });
 
   // 描画
-  var tbody=document.querySelector('#sumTbl tbody'); tbody.innerHTML='';
+  tableBody.innerHTML='';
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
     var pts = detailsMap[r.gkey] || [];
@@ -656,7 +652,7 @@ function render(){
     var canvas=document.createElement('canvas'); canvas.width=tdwrap.clientWidth||800; canvas.height=200;
     div.appendChild(canvas);
     var meta=document.createElement('div'); meta.className="meta";
-    meta.textContent="クリックで開閉／横軸=0–24時（データ無区間は線を非表示）／縦軸固定0–300ms（100ms赤破線）／role=SAASはHTTPヘッダ遅延、それ以外はICMP RTT";
+    meta.textContent="クリックで開閉／横軸=0–24時（データ無区間は線を非表示）／縦軸固定0–300ms（100ms赤破線）／縦補助線=1時間ごと／時間ラベル=2時間ごと／role=SAASはHTTPヘッダ遅延、それ以外はICMP RTT";
     tdwrap.appendChild(div); tdwrap.appendChild(meta); dtr.appendChild(tdwrap);
 
     tr.addEventListener('click', function(dtrRef,cvRef,points){
@@ -666,7 +662,7 @@ function render(){
       };
     }(dtr,canvas,pts));
 
-    tbody.appendChild(tr); tbody.appendChild(dtr);
+    tableBody.appendChild(tr); tableBody.appendChild(dtr);
   }
   setSortIndicator();
 }
