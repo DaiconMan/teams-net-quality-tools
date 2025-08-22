@@ -1,10 +1,9 @@
+
 <# 
 .SYNOPSIS
   Aruba "show ap debug radio-stats" スナップショットの差分/秒を算出し、CSV/HTML を生成（JST表示）。
-  - 上部カードに簡易診断（Simple/Tips/副次）を表示
-  - ただし CSV/HTML の「行末列」としての SimpleDiag/Tips は出力しない（要望対応）
-  - Output Time が「... UTC」でも厳密にUTCとして取り込み→JST変換
-  - Output Time が無い場合、ファイル更新時刻をJSTで表示にフォールバック
+  - 表（CSV/HTML）の行末に SimpleDiag/Tips は出力しない（上部カードのみ）
+  - 「Output Time:YYYY-MM-DD HH:mm:ss UTC」等を厳密にUTCとして解釈→JST変換
   - -SnapshotFiles はフォルダ/ワイルドカード/ファイル混在OK（展開後2ファイル以上）
   - Channel/Band 抽出、LAA/NR-U候補表示、時間帯コメント
 
@@ -16,15 +15,12 @@
 
 [CmdletBinding()]
 param(
-  # 単区間比較
   [string]$BeforeFile,
   [string]$AfterFile,
   [int]$DurationSec,
 
-  # 時系列集計（展開後に2ファイル以上が必要）: ファイル/ワイルドカード/ディレクトリ混在可
   [string[]]$SnapshotFiles,
 
-  # 出力
   [string]$OutputCsv,
   [string]$OutputHtml,
   [string]$Title
@@ -42,7 +38,7 @@ $TH_PLCPHigh   = 50
 $TH_ChgHigh    = 3
 $TH_TxPHigh    = 10
 
-# LAA/NR-U 疑い（保守的）
+# LAA/NR-U 判定用
 $TH_LAA_MinInterf = 12
 $TH_LAA_MaxOther  = 10
 $TH_LAA_MinBusy   = 35
@@ -100,80 +96,69 @@ function TryExtractPercentTriplet {
   return $ok
 }
 
-# ===== 文字列→UTC（DateTime） =====
-function Parse-AnyToUtc {
-  param([string]$s, [string]$cultureName)
-  $ci = $null
-  try { if (-not [string]::IsNullOrWhiteSpace($cultureName)) { $ci = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName) } } catch { $ci = $null }
-  if ($ci -eq $null) { $ci = [System.Globalization.CultureInfo]::InvariantCulture }
-
-  $dto = [System.DateTimeOffset]::MinValue
-  $ok = [System.DateTimeOffset]::TryParse($s, $ci, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)
-  if ($ok) { return $dto.UtcDateTime }
-
-  $dt = [DateTime]::MinValue
-  $ok2 = [DateTime]::TryParse($s, $ci, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)
-  if ($ok2) {
-    if ($dt.Kind -ne [System.DateTimeKind]::Utc) { $dt = [DateTime]::SpecifyKind($dt, [System.DateTimeKind]::Utc) }
-    return $dt
-  }
-
-  try {
-    $dt2 = [DateTime]::Parse($s, $ci)
-    $dt2 = [DateTime]::SpecifyKind($dt2, [System.DateTimeKind]::Utc)
-    return $dt2
-  } catch { return $null }
-}
-
-# ===== Output Time 抽出（UTCで返す） =====
+# ===== Output Time パース（UTCで返す） =====
 function Extract-OutputTime {
   param([string[]]$Lines)
-  $cand=@(); foreach($raw in $Lines){ if($raw -match '(?i)(output\s*time|出力(時刻|時間|日時)|生成時刻)'){ $cand+=$raw } }
-  if ($cand.Count -eq 0) { return $null }
 
-  # 1) Unix epoch (sec) → UTC
-  foreach($line in $cand){
+  if ($Lines -eq $null -or $Lines.Count -eq 0) { return $null }
+
+  # --- まず "Output Time" 行の右辺を優先的に解析 ---
+  foreach ($raw in $Lines) {
+    $line = ($raw -replace '\r','').Trim()
+    if ($line -match '^(?i)\s*Output\s*Time\s*[:=]\s*(.+)$') {
+      $rhs = $Matches[1].Trim()
+
+      # 1) Unix epoch（10桁/13桁）
+      if ($rhs -match '^\d{10}(\.\d+)?$') {
+        try { $sec = [long]([double]$rhs); return ([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime } catch {}
+      }
+      if ($rhs -match '^\d{13}$') {
+        try { $ms = [long]$rhs; return ([System.DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime } catch {}
+      }
+
+      # 2) "YYYY-MM-DD HH:mm:ss UTC/GMT"
+      if ($rhs -match '^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b') {
+        try {
+          $dt = [DateTime]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
+          $dt = [DateTime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+          return $dt
+        } catch {}
+      }
+
+      # 3) ISO8601 with Z / +hh:mm
+      $dto = [System.DateTimeOffset]::MinValue
+      if ([System.DateTimeOffset]::TryParse($rhs, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) {
+        return $dto.UtcDateTime
+      }
+
+      # 4) よくあるローカル風書式は "UTC 扱い" として捕捉 (フェイルセーフ)
+      try {
+        $dt2 = [DateTime]::Parse($rhs, [System.Globalization.CultureInfo]::InvariantCulture)
+        $dt2 = [DateTime]::SpecifyKind($dt2, [System.DateTimeKind]::Utc)
+        return $dt2
+      } catch {}
+    }
+  }
+
+  # --- 上記で取れない場合、従来の全行スキャン ---
+  $cands = @()
+  foreach ($raw in $Lines) {
+    if ($raw -match '(?i)(output\s*time|出力(時刻|時間|日時)|生成時刻)') { $cands += $raw }
+  }
+  if ($cands.Count -eq 0) { return $null }
+
+  foreach($line in $cands){
     $m=[regex]::Match($line,'(?<!\d)(\d{10})(?:\.\d+)?(?!\d)')
     if($m.Success){ try{ $sec=[long]([double]$m.Groups[1].Value); return ([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime }catch{} }
   }
-
-  # 2) ISO 8601 / "YYYY-MM-DD HH:mm:ssZ" / +hh:mm → UTC扱い
-  foreach($line in $cand){
+  foreach($line in $cands){
+    $m=[regex]::Match($line,'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if($m.Success){ try{ $dt=[DateTime]::Parse($m.Groups[1].Value,[System.Globalization.CultureInfo]::InvariantCulture); return [DateTime]::SpecifyKind($dt,[System.DateTimeKind]::Utc) }catch{} }
+  }
+  foreach($line in $cands){
     $m=[regex]::Match($line,'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:Z|[+\-]\d{2}:\d{2})?)')
-    if($m.Success){ $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName ''; if ($u -ne $null) { return $u } }
-  }
-
-  # 2.5) "YYYY-MM-DD HH:mm:ss UTC/GMT" → UTCとして解釈（★追加）
-  foreach($line in $cand){
-    $m=[regex]::Match($line,'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if($m.Success){
-      try{
-        $dt = [DateTime]::Parse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
-        $dt = [DateTime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
-        return $dt
-      }catch{}
-    }
-  }
-
-  # 3) "MM/DD/YYYY HH:mm:ss" 等 → UTCとして扱う
-  foreach($line in $cand){
-    $m=[regex]::Match($line,'((\d{1,4})/(\d{1,2})/(\d{1,4})\s+\d{1,2}:\d{2}:\d{2})')
-    if($m.Success){
-      $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName 'ja-JP'
-      if ($u -eq $null) { $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName 'en-US' }
-      if ($u -ne $null) { return $u }
-    }
-  }
-
-  # 4) "Mon 12 23:59:01 [YYYY]" → UTCとして扱う
-  foreach($line in $cand){
-    $m=[regex]::Match($line,'([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\s+\d{4})?)')
-    if($m.Success){
-      $s=$m.Groups[1].Value
-      if($s -notmatch '\s\d{4}$'){ $s = "$s " + (Get-Date).Year }
-      $u = Parse-AnyToUtc -s $s -cultureName 'en-US'
-      if ($u -ne $null) { return $u }
-    }
+    if($m.Success){ $u = [System.DateTimeOffset]::Parse($m.Groups[1].Value); return $u.UtcDateTime }
   }
   return $null
 }
@@ -188,7 +173,7 @@ function Get-BandFromChannel {
   return ''
 }
 
-# ===== 診断（カード生成用） =====
+# ===== 診断（カード用） =====
 function Make-Diagnosis {
   param(
     [double]$Busy64,[double]$BusyB,[double]$TxB,[double]$RxB,
@@ -439,7 +424,7 @@ function Expand-SnapshotInputs {
   return $out
 }
 
-# ===== 入力展開（単区間 or 時系列） =====
+# ===== 入力展開 =====
 $segments = @()
 
 if ($SnapshotFiles -and $SnapshotFiles.Count -ge 1) {
@@ -534,7 +519,7 @@ $colDefs = @(
   @('CCA_Interference_pct','CCA内訳: 非Wi-Fi干渉（%）')
 )
 
-# CSV ヘッダ出力
+# CSV ヘッダ
 $csvHeader = ($colDefs | ForEach-Object { $_[0] }) -join ','
 Set-Content -LiteralPath $OutputCsv -Value $csvHeader -Encoding UTF8
 
@@ -543,26 +528,18 @@ $rows = @()
 $cards = @()
 $hourBuckets = @{}
 
-# 出力時刻のフォールバック関数（JST）
-function Get-FileTimeJst {
-  param([string]$p)
-  try { return Convert-ToJst ([System.IO.File]::GetLastWriteTime($p)) } catch { return $null }
-}
+function Get-FileTimeJst { param([string]$p) try { return Convert-ToJst ([System.IO.File]::GetLastWriteTime($p)) } catch { return $null } }
 
 foreach ($seg in $segments) {
   $before = $seg.Before.Data
   $after  = $seg.After.Data
   $dur    = $seg.DurationSec
 
-  # 表示用時刻（JST）：OutputTime優先、無ければ更新時刻にフォールバック
+  # 表示用時刻（JST）：OutputTime優先、無ければ更新時刻JSTへ
   $startDisp = $seg.StartJst
-  if ($startDisp -eq $null -and $seg.Before -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.Before.Path)) {
-    $startDisp = Get-FileTimeJst -p $seg.Before.Path
-  }
+  if ($startDisp -eq $null -and $seg.Before -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.Before.Path)) { $startDisp = Get-FileTimeJst -p $seg.Before.Path }
   $endDisp = $seg.EndJst
-  if ($endDisp -eq $null -and $seg.After -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.After.Path)) {
-    $endDisp = Get-FileTimeJst -p $seg.After.Path
-  }
+  if ($endDisp -eq $null -and $seg.After -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.After.Path)) { $endDisp = Get-FileTimeJst -p $seg.After.Path }
 
   # キーの和集合
   $keys = New-Object System.Collections.Generic.HashSet[string]
@@ -612,12 +589,12 @@ foreach ($seg in $segments) {
     }
     if(-not $hasAny){ continue }
 
-    # 診断（カード用に生成）
+    # 診断（カード用）
     $d = Make-Diagnosis -Busy64 $busy64 -BusyB $busyB -TxB $txB -RxB $rxB `
                         -CCAO $ccaOt -CCAI $ccaI -Retry $retry_ps -CRC $crc_ps -PLCP $plcp_ps `
                         -ChgPH $chg_ph -TxPPH $txp_ph -Channel $chan
 
-    # === CSV 1行 ===
+    # === CSV 1行（Simple/Tips なし） ===
     $rowObj = New-Object psobject -Property @{
       AP=$ap; Radio=$radio; Channel=$chan; Band=$band; DurationSec=$dur;
       StartJST=$(if ($startDisp -ne $null){ $startDisp.ToString('yyyy-MM-dd HH:mm:ss') } else { '' });
@@ -638,7 +615,7 @@ foreach ($seg in $segments) {
     $escaped=@(); foreach($v in $vals){ if($v -match '[,"]'){ $escaped+=('"{0}"' -f ($v -replace '"','""')) } else { $escaped+=$v } }
     Add-Content -LiteralPath $OutputCsv -Value ($escaped -join ',') -Encoding UTF8
 
-    # === HTMLテーブル用行 ===
+    # === HTMLテーブル用 ===
     $rows += $rowObj
 
     # === 上部カード ===
@@ -686,10 +663,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
     } else { $titleText = "Aruba Radio Stats Diff（JST）" }
   }
 
-  # 列は colDefs に準拠（SimpleDiag/Tips 列は無し）
   $cols = $colDefs
-
-  # カード（上位10件）
   $topCards = $cards | Sort-Object -Property @{Expression='Score';Descending=$true} | Select-Object -First 10
 
   # 時間帯サマリ
@@ -741,7 +715,7 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   [void]$sb.AppendLine("<h1>{0}</h1>" -f (HtmlEscape $titleText))
   [void]$sb.AppendLine('<div class="small">※日時はすべて日本時間（JST）で表示。上は重点カード、下は明細テーブルです。</div>')
 
-  # 上部カード（Simple/Tipsはここに表示）
+  # カード
   if ($topCards -and $topCards.Count -gt 0) {
     [void]$sb.AppendLine('<div id="cards">')
     foreach ($c in $topCards) {
@@ -765,7 +739,7 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   # フィルタ
   [void]$sb.AppendLine('<div style="margin:10px 0"><input id="flt" type="search" placeholder="フィルタ（AP/数値/文言）..." oninput="filterTable()"></div>')
 
-  # 列の説明（Simple/Tipsは表には無い）
+  # 列の説明
   [void]$sb.AppendLine('<details class="help"><summary>列の見方（クリックで開閉）</summary><div><ul>')
   foreach ($pair in $cols) { [void]$sb.AppendLine('<li><b>'+ (HtmlEscape $pair[0]) +'</b>：'+ (HtmlEscape $pair[1]) +'</li>') }
   [void]$sb.AppendLine('</ul></div></details>')
@@ -778,7 +752,7 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
     [void]$sb.AppendLine('</div>')
   }
 
-  # 明細テーブル（Simple/Tips列なし）
+  # 明細テーブル（Simple/Tipsなし）
   [void]$sb.AppendLine('<table id="tbl"><thead><tr>')
   foreach ($pair in $cols) { $name=$pair[0]; $desc=$pair[1]; [void]$sb.AppendLine('<th title="'+ (HtmlEscape $desc) +'">'+ (HtmlEscape $name) +'</th>') }
   [void]$sb.AppendLine('</tr></thead><tbody>')
