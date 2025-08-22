@@ -5,14 +5,9 @@
   - 列ヘッダーの説明（ツールチップ＋開閉ヘルプ）
   - 表示時刻は日本時間（JST）
   - 複数スナップショット（時系列）対応。時間帯サマリコメントも生成
-  - NEW: -SnapshotFiles にディレクトリを渡すと、その直下のファイルをすべて取り込む（非再帰）
-
-.DESCRIPTION
-  二通りの使い方：
-    1) 単区間比較: -BeforeFile と -AfterFile を指定
-    2) 時系列集計: -SnapshotFiles に 2 個以上の入力（ファイル/ワイルドカード/ディレクトリ）
-       → 連続ペアごとに差分を取り、CSV/HTMLにJST時刻を付けて出力
-  経過秒は "output time" を優先して自動算出（失敗時はファイル更新時刻差→既定900秒）。
+  - LAA/NR-U 疑いの自動ラベル（副次シナリオ）
+  - Channel/Band を抽出して表示（取得できた場合）
+  - FIX: -SnapshotFiles は「展開後に2ファイル以上」で判定（フォルダ1つ指定でもOK）
 
 .NOTES
   - PowerShell 5.1対応。三項演算子(?)不使用。
@@ -27,7 +22,8 @@ param(
   [string]$AfterFile,
   [int]$DurationSec,
 
-  # 時系列集計（2入力以上）。ファイル、ワイルドカード、ディレクトリ混在可。
+  # 時系列集計（2入力以上）: ファイル/ワイルドカード/ディレクトリ混在可
+  # ↓※この配列の要素数は1でもOK（フォルダ1個など）。展開後に2ファイル以上必要。
   [string[]]$SnapshotFiles,
 
   # 出力
@@ -36,7 +32,7 @@ param(
   [string]$Title
 )
 
-# ===== しきい値（必要に応じて調整） =====
+# ===== しきい値 =====
 $TH_BusyHigh   = 60
 $TH_BusyWarn   = 40
 $TH_ExcessCCA  = 15
@@ -48,14 +44,25 @@ $TH_PLCPHigh   = 50
 $TH_ChgHigh    = 3
 $TH_TxPHigh    = 10
 
-# ===== JST 変換 =====
+# LAA/NR-U 疑い（保守的に判定）
+$TH_LAA_MinInterf = 12   # CCA_Interference %
+$TH_LAA_MaxOther  = 10   # CCA_Other %
+$TH_LAA_MinBusy   = 35   # Busy64 %
+
+# ===== JST 変換（UTC → JST） =====
 function Convert-ToJst {
   param([Nullable[DateTime]]$dt)
   if ($dt -eq $null) { return $null }
   try { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Tokyo Standard Time") } catch { $tz = [System.TimeZoneInfo]::Local }
   try {
-    if ($dt.Value.Kind -eq [System.DateTimeKind]::Utc) { return [System.TimeZoneInfo]::ConvertTimeFromUtc($dt.Value, $tz) }
-    else { return [System.TimeZoneInfo]::ConvertTime($dt.Value, $tz) }
+    if ($dt.Value.Kind -eq [System.DateTimeKind]::Utc) {
+      return [System.TimeZoneInfo]::ConvertTimeFromUtc($dt.Value, $tz)
+    } elseif ($dt.Value.Kind -eq [System.DateTimeKind]::Local) {
+      return [System.TimeZoneInfo]::ConvertTime($dt.Value, $tz)
+    } else {
+      $utc = [DateTime]::SpecifyKind($dt.Value, [System.DateTimeKind]::Utc)
+      return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+    }
   } catch { return $dt }
 }
 
@@ -71,7 +78,7 @@ function Get-ParentOrCwd {
   return $dir
 }
 
-# ===== 表示用ユーティリティ =====
+# ===== 表示ユーティリティ =====
 function HtmlEscape { param([string]$s)
   if ($null -eq $s) { return '' }
   $r = $s.Replace('&','&amp;'); $r = $r.Replace('<','&lt;'); $r = $r.Replace('>','&gt;')
@@ -79,7 +86,7 @@ function HtmlEscape { param([string]$s)
 }
 function Sanitize-Text { param([string]$s) if ($null -eq $s) { return '' } return $s.Replace('"','"') }
 
-# ===== テキスト解析ユーティリティ =====
+# ===== 数値抽出 =====
 function Get-LastNumber { param([string]$Line)
   if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
   $m = [regex]::Matches($Line, '(-?\d+(?:\.\d+)?)')
@@ -94,41 +101,85 @@ function TryExtractPercentTriplet {
   $m64= [regex]::Match($Line, '\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)'); if ($m64.Success){ $Busy64s.Value= [double]$m64.Groups[1].Value; $ok = $true }
   return $ok
 }
+
+# ===== 汎用パース（文字列→UTC） =====
+function Parse-AnyToUtc {
+  param([string]$s, [string]$cultureName)
+  $ci = $null
+  try { if (-not [string]::IsNullOrWhiteSpace($cultureName)) { $ci = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName) } } catch { $ci = $null }
+  if ($ci -eq $null) { $ci = [System.Globalization.CultureInfo]::InvariantCulture }
+
+  $dto = [System.DateTimeOffset]::MinValue
+  $ok = [System.DateTimeOffset]::TryParse($s, $ci, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)
+  if ($ok) { return $dto.UtcDateTime }
+
+  $dt = [DateTime]::MinValue
+  $ok2 = [DateTime]::TryParse($s, $ci, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)
+  if ($ok2) {
+    if ($dt.Kind -ne [System.DateTimeKind]::Utc) { $dt = [DateTime]::SpecifyKind($dt, [System.DateTimeKind]::Utc) }
+    return $dt
+  }
+
+  try {
+    $dt2 = [DateTime]::Parse($s, $ci)
+    $dt2 = [DateTime]::SpecifyKind($dt2, [System.DateTimeKind]::Utc)
+    return $dt2
+  } catch { return $null }
+}
+
+# ===== output time 抽出（UTCで返す） =====
 function Extract-OutputTime {
   param([string[]]$Lines)
   $cand=@(); foreach($raw in $Lines){ if($raw -match '(?i)(output\s*time|出力(時刻|時間|日時)|生成時刻)'){ $cand+=$raw } }
   if ($cand.Count -eq 0) { return $null }
+
   foreach($line in $cand){
-    $m=[regex]::Match($line,'(?<!\d)(\d{10})(?:\.\d+)?(?!\d)'); if($m.Success){ try{ return ([DateTime]'1970-01-01').AddSeconds([double]$m.Groups[1].Value) }catch{} }
+    $m=[regex]::Match($line,'(?<!\d)(\d{10})(?:\.\d+)?(?!\d)')
+    if($m.Success){ try{ $sec=[long]([double]$m.Groups[1].Value); return ([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime }catch{} }
   }
   foreach($line in $cand){
-    $m=[regex]::Match($line,'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})'); if($m.Success){ try{ return [DateTime]::Parse($m.Groups[1].Value,[System.Globalization.CultureInfo]::InvariantCulture) }catch{} }
+    $m=[regex]::Match($line,'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:Z|[+\-]\d{2}:\d{2})?)')
+    if($m.Success){ $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName ''; if ($u -ne $null) { return $u } }
   }
   foreach($line in $cand){
     $m=[regex]::Match($line,'((\d{1,4})/(\d{1,2})/(\d{1,4})\s+\d{1,2}:\d{2}:\d{2})')
     if($m.Success){
-      try{ return [DateTime]::Parse($m.Groups[1].Value,[System.Globalization.CultureInfo]::InvariantCulture) }catch{}
-      try{ return [DateTime]::Parse($m.Groups[1].Value,[System.Globalization.CultureInfo]::GetCultureInfo('ja-JP')) }catch{}
-      try{ return [DateTime]::Parse($m.Groups[1].Value,[System.Globalization.CultureInfo]::GetCultureInfo('en-US')) }catch{}
+      $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName 'ja-JP'
+      if ($u -eq $null) { $u = Parse-AnyToUtc -s $m.Groups[1].Value -cultureName 'en-US' }
+      if ($u -ne $null) { return $u }
     }
   }
   foreach($line in $cand){
     $m=[regex]::Match($line,'([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\s+\d{4})?)')
     if($m.Success){
-      $s=$m.Groups[1].Value; if($s -notmatch '\s\d{4}$'){ $s = "$s " + (Get-Date).Year }
-      try{ return [DateTime]::Parse($s,[System.Globalization.CultureInfo]::GetCultureInfo('en-US')) }catch{}
+      $s=$m.Groups[1].Value
+      if($s -notmatch '\s\d{4}$'){ $s = "$s " + (Get-Date).Year }
+      $u = Parse-AnyToUtc -s $s -cultureName 'en-US'
+      if ($u -ne $null) { return $u }
     }
   }
   return $null
 }
 
-# ===== 診断（主原因＋副次＋対策＋重み） =====
+# ===== チャネル→バンド推定 =====
+function Get-BandFromChannel {
+  param([Nullable[int]]$Channel)
+  if ($Channel -eq $null) { return '' }
+  $ch = [int]$Channel
+  if ($ch -ge 1 -and $ch -le 14) { return '2.4GHz' }
+  if ($ch -ge 32 -and $ch -le 196) { return '5GHz' }
+  return ''
+}
+
+# ===== 診断（主因＋副次＋対策＋スコア＋LAA/NR-U候補） =====
 function Make-Diagnosis {
   param(
     [double]$Busy64,[double]$BusyB,[double]$TxB,[double]$RxB,
     [double]$CCAO,[double]$CCAI,[double]$Retry,[double]$CRC,[double]$PLCP,
-    [double]$ChgPH,[double]$TxPPH
+    [double]$ChgPH,[double]$TxPPH,
+    [Nullable[int]]$Channel
   )
+
   $deltaCCA = $null
   if ($BusyB -ne $null -and $TxB -ne $null -and $RxB -ne $null) { $deltaCCA = $BusyB - ($TxB + $RxB) }
 
@@ -208,12 +259,31 @@ function Make-Diagnosis {
     $secList.Add((Sanitize-Text $sec))
   }
 
+  # --- LAA/NR-U 疑い ---
+  $band = Get-BandFromChannel -Channel $Channel
+  $laaHit = $false
+  if (-not [string]::IsNullOrWhiteSpace($band)) {
+    if ($band -eq '5GHz') {
+      if ($CCAI -ne $null -and $CCAI -ge $TH_LAA_MinInterf) {
+        $okOther = $false
+        if ($CCAO -eq $null) { $okOther = $true } else { if ($CCAO -lt $TH_LAA_MaxOther) { $okOther = $true } }
+        if ($okOther) {
+          if ($Busy64 -ne $null -and $Busy64 -ge $TH_LAA_MinBusy) { $laaHit = $true }
+        }
+      }
+    }
+  }
+  if ($laaHit) {
+    $msg = "候補：LAA/NR-Uの可能性（5GHz ch"+$Channel+"、Interf "+([int]$CCAI)+"%、Other "+([int]$CCAO)+"%、Busy64 "+([int]$Busy64)+"%）"
+    $secList.Add((Sanitize-Text $msg))
+  }
+
   $oneLine=Sanitize-Text ($simple+" "+$why)
   $tips   =Sanitize-Text $tips
   $mainScore = $scores[$maxIdx] + ($power[$maxIdx] / 100.0)
 
   return New-Object psobject -Property @{
-    Simple=$oneLine; Tips=$tips; Secondary=$secList; Severity=$sev; Score=$mainScore
+    Simple=$oneLine; Tips=$tips; Secondary=$secList; Severity=$sev; Score=$mainScore; Band=$band
   }
 }
 
@@ -224,12 +294,12 @@ function Diff-NonNegative { param([double]$After,[double]$Before)
   return $d
 }
 
-# ===== パーサ（誤認抑止） =====
+# ===== パーサ =====
 function Parse-RadioStatsFile {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
   $lines = Get-Content -LiteralPath $Path -Encoding UTF8
-  $outTime = Extract-OutputTime -Lines $lines
+  $outTime = Extract-OutputTime -Lines $lines  # UTC
 
   $result = @{}; $ap = ''; $radio = ''
   foreach ($raw in $lines) {
@@ -254,7 +324,15 @@ function Parse-RadioStatsFile {
     if (-not $isMetric -and $line -match '(?i)\bChannel\s*busy\b') { $isMetric = $true }
     if (-not $isMetric -and $line -match '(?i)\b(Ch|Tx|Rx)\s*Time\s*perct\s*@\s*beacon') { $isMetric = $true }
     if (-not $isMetric -and $line -match '(?i)\bCCA\b.*\b(bss|interference)\b') { $isMetric = $true }
-    if (-not $isMetric) { continue }
+
+    # チャネル抽出
+    $channelNum = $null
+    if ($line -match '(?i)\b(Current|Primary|Operating)\s*Channel\s*[:=]\s*(\d{1,3})\b') {
+      try { $channelNum = [int]$Matches[2] } catch { $channelNum = $null }
+    } elseif ($line -match '(?i)\bChannel\s*[:=]\s*(\d{1,3})\b' -and ($line -notmatch '(?i)Channel\s*Changes')) {
+      try { $channelNum = [int]$Matches[1] } catch { $channelNum = $null }
+    }
+    if (-not $isMetric -and $channelNum -eq $null) { continue }
 
     $key = ''
     if (-not [string]::IsNullOrWhiteSpace($ap)) { if (-not [string]::IsNullOrWhiteSpace($radio)) { $key = "$ap|$radio" } else { $key = "$ap|?" } }
@@ -267,7 +345,8 @@ function Parse-RadioStatsFile {
         ChannelChanges = $null; TxPowerChanges = $null;
         Busy1s = $null; Busy4s = $null; Busy64s = $null;
         BusyBeacon = $null; TxBeacon = $null; RxBeacon = $null;
-        CCA_Our = $null; CCA_Other = $null; CCA_Interference = $null
+        CCA_Our = $null; CCA_Other = $null; CCA_Interference = $null;
+        Channel = $null
       }
       $result[$key] = $obj
     }
@@ -296,12 +375,14 @@ function Parse-RadioStatsFile {
     if     ($line -match '(?i)\bCCA\b.*\bour\b.*\bbss\b')      { $v = Get-LastNumber $line; if ($v -ne $null) { $cur.CCA_Our          = [double]$v } }
     elseif ($line -match '(?i)\bCCA\b.*\bother\b.*\bbss\b')    { $v = Get-LastNumber $line; if ($v -ne $null) { $cur.CCA_Other        = [double]$v } }
     elseif ($line -match '(?i)\bCCA\b.*\binterference\b')      { $v = Get-LastNumber $line; if ($v -ne $null) { $cur.CCA_Interference = [double]$v } }
+
+    if ($channelNum -ne $null) { $cur.Channel = [int]$channelNum }
   }
 
   return New-Object psobject -Property @{ Data = $result; OutputTime = $outTime; Path = $Path }
 }
 
-# ===== NEW: -SnapshotFiles の入力展開（ディレクトリ/ワイルドカード対応, 非再帰） =====
+# ===== -SnapshotFiles 展開（非再帰） =====
 function Expand-SnapshotInputs {
   param([string[]]$Inputs)
   $files = New-Object System.Collections.Generic.List[string]
@@ -315,7 +396,6 @@ function Expand-SnapshotInputs {
       try { $it = Get-Item -LiteralPath $p -ErrorAction Stop } catch { $it = $null }
       if ($it -ne $null) {
         if ($it.PSIsContainer) {
-          # ディレクトリ：直下のファイルをすべて取り込む（非再帰）
           $items = @()
           try { $items = Get-ChildItem -LiteralPath $it.FullName -File -ErrorAction Stop } catch { $items = @() }
           foreach ($f in $items) { $files.Add($f.FullName) }
@@ -324,7 +404,6 @@ function Expand-SnapshotInputs {
         }
       }
     } else {
-      # ワイルドカード等
       $parent = $null; $leaf = $null
       try { $parent = Split-Path -Path $p -Parent } catch { $parent = $null }
       try { $leaf   = Split-Path -Path $p -Leaf } catch { $leaf = $p }
@@ -337,7 +416,6 @@ function Expand-SnapshotInputs {
     }
   }
 
-  # 重複排除
   $set = New-Object System.Collections.Generic.HashSet[string]
   $out = New-Object System.Collections.Generic.List[string]
   foreach ($f in $files) { if (-not $set.Contains($f)) { $set.Add($f) | Out-Null; $out.Add($f) } }
@@ -345,12 +423,14 @@ function Expand-SnapshotInputs {
 }
 
 # ===== 入力展開（単区間 or 時系列） =====
-$segments = @() # 各要素: @{ Before=..., After=..., DurationSec=..., StartJst=..., EndJst=... }
+$segments = @() # @{ Before=..., After=..., DurationSec=..., StartJst=..., EndJst=... }
 
-if ($SnapshotFiles -and $SnapshotFiles.Count -ge 2) {
-  # まずファイルリストを展開
+# ★修正点：SnapshotFiles が 1個でも指定されていれば展開 → 展開後のファイル数で判定
+if ($SnapshotFiles -and $SnapshotFiles.Count -ge 1) {
   $fileList = Expand-SnapshotInputs -Inputs $SnapshotFiles
-  if ($fileList.Count -lt 2) { throw "SnapshotFiles はファイルが2つ以上必要です（ディレクトリ/ワイルドカード可, 非再帰）。" }
+  if ($fileList.Count -lt 2) {
+    throw "SnapshotFiles: 指定されたパス（フォルダ/ワイルドカード/ファイル）から2つ以上のファイルが見つかりません。フォルダなら直下に2つ以上のファイルを置くか、比較したい複数ファイル/ワイルドカードを指定してください。"
+  }
 
   # パース → output time（無ければ更新時刻）で時系列ソート
   $parsed = @()
@@ -376,10 +456,8 @@ if ($SnapshotFiles -and $SnapshotFiles.Count -ge 2) {
       StartJst = (Convert-ToJst $bt); EndJst = (Convert-ToJst $at)
     })
   }
-} else {
-  if ([string]::IsNullOrWhiteSpace($BeforeFile) -or [string]::IsNullOrWhiteSpace($AfterFile)) {
-    throw "単区間比較は -BeforeFile と -AfterFile を指定、時系列集計は -SnapshotFiles に2個以上（ディレクトリ/ワイルドカード可）を指定してください。"
-  }
+}
+elseif (-not [string]::IsNullOrWhiteSpace($BeforeFile) -and -not [string]::IsNullOrWhiteSpace($AfterFile)) {
   $b = Parse-RadioStatsFile -Path $BeforeFile
   $a = Parse-RadioStatsFile -Path $AfterFile
   $bt = $b.OutputTime; $at = $a.OutputTime
@@ -403,6 +481,9 @@ if ($SnapshotFiles -and $SnapshotFiles.Count -ge 2) {
     StartJst = (Convert-ToJst $bt); EndJst = (Convert-ToJst $at)
   })
 }
+else {
+  throw "単区間比較は -BeforeFile と -AfterFile を指定、時系列集計は -SnapshotFiles に（フォルダ/ワイルドカード/ファイルいずれでも）**1個以上**を指定してください。展開後に2つ以上のファイルが必要です。"
+}
 
 # ===== CSV 出力先 =====
 if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
@@ -413,9 +494,9 @@ if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
   $OutputCsv = Join-Path -Path $outDir -ChildPath ("aruba_radio_stats_diff_{0}.csv" -f $ts)
 }
 
-# ===== CSV ヘッダ（JST 時刻＋診断） =====
+# ===== CSV ヘッダ =====
 $header = @(
-  'AP','Radio','DurationSec',
+  'AP','Radio','Channel','Band','DurationSec',
   'StartJST','EndJST',
   'RxRetry_per_s','RxCRC_per_s','RxPLCP_per_s',
   'ChannelChanges_per_h','TxPowerChanges_per_h',
@@ -426,10 +507,10 @@ $header = @(
 ) -join ','
 Set-Content -LiteralPath $OutputCsv -Value $header -Encoding UTF8
 
-# ===== 集計・行生成 =====
-$rows = @()        # HTML 表示用の行
-$cards = @()       # 上位カード（SimpleDiag+Tips+副次）
-$hourBuckets = @{} # 時間帯ごとの集計
+# ===== 集計 =====
+$rows = @()
+$cards = @()
+$hourBuckets = @{}
 
 foreach ($seg in $segments) {
   $before = $seg.Before.Data
@@ -437,7 +518,6 @@ foreach ($seg in $segments) {
   $dur    = $seg.DurationSec
   $startJ = $seg.StartJst; $endJ = $seg.EndJst
 
-  # キーの和集合
   $keys = New-Object System.Collections.Generic.HashSet[string]
   foreach ($k in $before.Keys) { [void]$keys.Add($k) }
   foreach ($k in $after.Keys)  { [void]$keys.Add($k) }
@@ -452,7 +532,6 @@ foreach ($seg in $segments) {
     if ([string]::IsNullOrWhiteSpace($ap) -and $b -ne $null) { $ap=$b.AP }
     if ([string]::IsNullOrWhiteSpace($radio) -and $b -ne $null) { $radio=$b.Radio }
 
-    # 差分
     $dRetry = Diff-NonNegative $a.RxRetry $b.RxRetry
     $dCRC   = Diff-NonNegative $a.RxCRC   $b.RxCRC
     $dPLCP  = Diff-NonNegative $a.RxPLCP  $b.RxPLCP
@@ -476,22 +555,21 @@ foreach ($seg in $segments) {
     $ccaO   = Pick-AfterFirst $a.CCA_Our $b.CCA_Our
     $ccaOt  = Pick-AfterFirst $a.CCA_Other $b.CCA_Other
     $ccaI   = Pick-AfterFirst $a.CCA_Interference $b.CCA_Interference
+    $chan   = Pick-AfterFirst $a.Channel $b.Channel
+    $band   = Get-BandFromChannel -Channel $chan
 
-    # 空行抑止
     $hasAny=$false
     foreach($vv in @($retry_ps,$crc_ps,$plcp_ps,$chg_ph,$txp_ph,$busy1s,$busy4s,$busy64,$busyB,$txB,$rxB,$ccaO,$ccaOt,$ccaI)){
       if($vv -ne $null -and $vv -ne ''){ $hasAny=$true }
     }
     if(-not $hasAny){ continue }
 
-    # 診断
     $d = Make-Diagnosis -Busy64 $busy64 -BusyB $busyB -TxB $txB -RxB $rxB `
                         -CCAO $ccaOt -CCAI $ccaI -Retry $retry_ps -CRC $crc_ps -PLCP $plcp_ps `
-                        -ChgPH $chg_ph -TxPPH $txp_ph
+                        -ChgPH $chg_ph -TxPPH $txp_ph -Channel $chan
 
-    # CSV 行
     $vals = @(
-      $ap,$radio,$dur,
+      $ap,$radio,$chan,$band,$dur,
       $(if ($startJ -ne $null) { $startJ.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }),
       $(if ($endJ   -ne $null) { $endJ.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }),
       $retry_ps,$crc_ps,$plcp_ps,
@@ -504,9 +582,8 @@ foreach ($seg in $segments) {
     $escaped=@(); foreach($v in $vals){ if($v -match '[,"]'){ $escaped+=('"{0}"' -f ($v -replace '"','""')) } else { $escaped+=$v } }
     Add-Content -LiteralPath $OutputCsv -Value ($escaped -join ',') -Encoding UTF8
 
-    # HTML 行
     $rows += (New-Object psobject -Property @{
-      AP=$ap; Radio=$radio; DurationSec=$dur;
+      AP=$ap; Radio=$radio; Channel=$chan; Band=$band; DurationSec=$dur;
       StartJST=$(if ($startJ -ne $null){ $startJ.ToString('yyyy-MM-dd HH:mm:ss') } else { '' });
       EndJST  =$(if ($endJ   -ne $null){ $endJ.ToString('yyyy-MM-dd HH:mm:ss') } else { '' });
       RxRetry_per_s=$retry_ps; RxCRC_per_s=$crc_ps; RxPLCP_per_s=$plcp_ps;
@@ -517,14 +594,12 @@ foreach ($seg in $segments) {
       SimpleDiag=$d.Simple; Tips=$d.Tips; Severity=$d.Severity; Score=$d.Score; Secondary=$d.Secondary
     })
 
-    # カード候補
     $cards += (New-Object psobject -Property @{
-      AP=$ap; Radio=$radio;
+      AP=$ap; Radio=$radio; Channel=$chan; Band=$band;
       EndJST=$(if ($endJ -ne $null){ $endJ.ToString('yyyy-MM-dd HH:mm') } else { '' });
       Simple=$d.Simple; Tips=$d.Tips; Secondary=$d.Secondary; Severity=$d.Severity; Score=$d.Score
     })
 
-    # 時間帯バケット（End の時台）
     if ($endJ -ne $null) {
       $key = $endJ.ToString('HH')
       if (-not $hourBuckets.ContainsKey($key)) {
@@ -565,6 +640,8 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
   $cols = @(
     @('AP','AP 名'),
     @('Radio','ラジオ番号（0/1 等）'),
+    @('Channel','運用チャネル番号（取得できた場合）'),
+    @('Band','2.4GHz/5GHz（チャネルから推定）'),
     @('DurationSec','比較区間の秒数'),
     @('StartJST','区間開始（日本時間）'),
     @('EndJST','区間終了（日本時間）'),
@@ -586,10 +663,8 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
     @('Tips','おすすめ対策')
   )
 
-  # カード（上位10件、Score降順）
   $topCards = $cards | Sort-Object -Property @{Expression='Score';Descending=$true} | Select-Object -First 10
 
-  # 時間帯サマリコメント（JST）
   $hourComments = New-Object System.Text.StringBuilder
   $hours = $hourBuckets.Keys | Sort-Object
   foreach ($hh in $hours) {
@@ -611,7 +686,6 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
     $null = $hourComments.AppendLine( (Sanitize-Text ($msg + [string]::Join(" / ", $notes))) )
   }
 
-  # ---- HTML ----
   $sb = New-Object System.Text.StringBuilder
   [void]$sb.AppendLine('<!DOCTYPE html>')
   [void]$sb.AppendLine('<meta charset="UTF-8">')
@@ -638,15 +712,18 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   </style>')
 
   [void]$sb.AppendLine("<h1>{0}</h1>" -f (HtmlEscape $titleText))
-  [void]$sb.AppendLine('<div class="small">表示は日本時間（JST）。上は重点の一言診断カード、下は明細テーブルです。</div>')
+  [void]$sb.AppendLine('<div class="small">※日時はすべて日本時間（JST）で表示しています。上は重点カード、下は明細テーブルです。</div>')
 
-  # 上位カード（SimpleDiag/Tips/副次）をフィルタの上に表示
   if ($topCards -and $topCards.Count -gt 0) {
     [void]$sb.AppendLine('<div id="cards">')
     foreach ($c in $topCards) {
       $cls = $c.Severity
       [void]$sb.AppendLine('<div class="diag-card '+$cls+'">')
-      [void]$sb.AppendLine('<div class="title">'+ (HtmlEscape ($c.AP+" / Radio "+$c.Radio+" @ "+$c.EndJST)) +'</div>')
+      $titleLine = $c.AP+" / Radio "+$c.Radio
+      if ($c.Channel -ne $null -and $c.Channel -ne '') { $titleLine = $titleLine + " ch" + $c.Channel }
+      if (-not [string]::IsNullOrWhiteSpace($c.Band)) { $titleLine = $titleLine + " ("+$c.Band+")" }
+      $titleLine = $titleLine + " @ " + $c.EndJST
+      [void]$sb.AppendLine('<div class="title">'+ (HtmlEscape $titleLine) +'</div>')
       [void]$sb.AppendLine('<div class="sub">'+ (HtmlEscape $c.Simple) +'</div>')
       if ($c.Secondary -ne $null -and $c.Secondary.Count -gt 0) {
         foreach ($s in $c.Secondary) { [void]$sb.AppendLine('<div class="sec">'+ (HtmlEscape $s) +'</div>') }
@@ -657,23 +734,18 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
     [void]$sb.AppendLine('</div>')
   }
 
-  # フィルタ
   [void]$sb.AppendLine('<div style="margin:10px 0"><input id="flt" type="search" placeholder="フィルタ（AP/数値/文言）..." oninput="filterTable()"></div>')
 
-  # ヘルプ（列説明）
   [void]$sb.AppendLine('<details class="help"><summary>列の見方（クリックで開閉）</summary><div><ul>')
   foreach ($pair in $cols) { [void]$sb.AppendLine('<li><b>'+ (HtmlEscape $pair[0]) +'</b>：'+ (HtmlEscape $pair[1]) +'</li>') }
   [void]$sb.AppendLine('</ul></div></details>')
 
-  # 時間帯サマリ
-  $hours = $hourBuckets.Keys | Sort-Object
   if ($hours.Count -gt 0) {
     [void]$sb.AppendLine('<div class="help"><b>時間帯サマリ（JST）</b><br>')
     [void]$sb.AppendLine((HtmlEscape ($hourComments.ToString().Trim())))
     [void]$sb.AppendLine('</div>')
   }
 
-  # 明細テーブル
   [void]$sb.AppendLine('<table id="tbl"><thead><tr>')
   foreach ($pair in $cols) { $name=$pair[0]; $desc=$pair[1]; [void]$sb.AppendLine('<th title="'+ (HtmlEscape $desc) +'">'+ (HtmlEscape $name) +'</th>') }
   [void]$sb.AppendLine('</tr></thead><tbody>')
