@@ -676,11 +676,30 @@ function Expand-SnapshotInputs { param([string[]]$Inputs)
 }
 
 # ===== 期間補正 =====
+
 function Fix-Duration {
   param([Nullable[datetime]]$bt,[Nullable[datetime]]$at,[string]$bPath,[string]$aPath)
   $sec=0
+  # Use .Value to avoid op_Subtraction on Nullable[DateTime]
   if ($bt -ne $null -and $at -ne $null) {
-    try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 }
+    try {
+      $b=[DateTime]$bt.Value
+      $a=[DateTime]$at.Value
+      $sec=[int][Math]::Abs(($a - $b).TotalSeconds)
+    } catch { $sec=0 }
+  }
+  if ($sec -lt 30) {
+    try {
+      $t1=[System.IO.File]::GetLastWriteTimeUtc($bPath)
+      $t2=[System.IO.File]::GetLastWriteTimeUtc($aPath)
+      $sec2=[int]([Math]::Abs(($t2 - $t1).TotalSeconds))
+      if ($sec2 -ge 30) { Write-Log ("Duration fix: using filetime {0}s (b={1} a={2})" -f $sec2,$t1,$t2); return $sec2 }
+    } catch {}
+    $sec=900
+    Write-Log ("Duration fix: too small; fallback to default 900s")
+  }
+  return $sec
+}
   }
   if ($sec -lt 30) {
     try {
