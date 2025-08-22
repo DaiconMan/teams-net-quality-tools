@@ -4,16 +4,14 @@
   - 同フォルダの "show ap bss-table" / "show aps" / "show ap debug radio-info" / "show ap arm history"
     テキストから AP名・Channel・Band を補完（バックアップ参照）
   - -SnapshotFiles はフォルダ/ワイルドカード/ファイル混在OK（展開後2ファイル以上）
-  - radio-stats 以外（arm history 等）はスナップショットとしては除外（補完専用）
+  - radio-stats 以外（arm history 等）はスナップショット対象外（補完専用）
   - LAA/NR-U 候補検出、時間帯コメント
   - PowerShell 5.1対応・三項演算子不使用・予約語 Host 未使用・OneDrive/日本語/スペース対応
 
-  ★ ログ機能（本修正）
-    - -LogFile で明示指定可。未指定時は OutputHtml/OutputCsv のフォルダに自動命名で出力
-    - 出力内容:
-        * Output Time の生行 / マッチ種別 / 解析UTC / Kind
-        * Convert-ToJst 入出力、使用TZ、フォールバック分岐
-        * ファイル時刻(JST)フォールバック、セグメント長(秒)、入力ファイルパス
+  ★ 本版の追加ログ
+    - AP名推定：どの経路で採れたか／候補値／フィルタ理由
+    - Channel/Band 由来：after/before/本文から直接／backup（bss-table/aps/radio-info/arm history）／推定
+    - backup 構築：各ファイルの分類・更新内容（AP/Ch/Band）
 #>
 
 [CmdletBinding()]
@@ -45,17 +43,15 @@ $TH_LAA_MinInterf = 12
 $TH_LAA_MaxOther  = 10
 $TH_LAA_MinBusy   = 35
 
-# ===== ログ =====
+# ===== ログ基盤 =====
 $Script:LogPath = $null
-function Write-Log {
-  param([string]$Msg)
+function Write-Log { param([string]$Msg)
   if ([string]::IsNullOrWhiteSpace($Script:LogPath)) { return }
   $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffK"
   $line = "[{0}] {1}" -f $ts, $Msg
   try { Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8 } catch {}
 }
-function Init-Log {
-  param([string]$Preferred,[string]$OutputHtmlPath,[string]$OutputCsvPath)
+function Init-Log { param([string]$Preferred,[string]$OutputHtmlPath,[string]$OutputCsvPath)
   if (-not [string]::IsNullOrWhiteSpace($Preferred)) {
     $Script:LogPath = $Preferred
     try {
@@ -82,9 +78,17 @@ function Init-Log {
   $Script:LogPath = Join-Path -Path $baseDir -ChildPath ("aruba_radio_stats_diff_LOG_{0}.txt" -f $ts)
   try { Set-Content -LiteralPath $Script:LogPath -Value "# Aruba Radio Stats Diff Log (UTF-8)" -Encoding UTF8 } catch {}
 }
+function Get-ErrMsg { param($e)
+  try {
+    if ($e -ne $null) {
+      if ($e.Exception -ne $null -and -not [string]::IsNullOrWhiteSpace($e.Exception.Message)) { return $e.Exception.Message }
+      return [string]$e
+    }
+  } catch {}
+  return ''
+}
 
-function ToLogStr-DT {
-  param([Nullable[DateTime]]$dt,[string]$Label)
+function ToLogStr-DT { param([Nullable[DateTime]]$dt,[string]$Label)
   if ($dt -eq $null) { return ("{0}=<null>" -f $Label) }
   $v = $dt.Value
   $kind = $v.Kind.ToString()
@@ -106,12 +110,12 @@ function Convert-ToJst {
     if ($tz -ne $null) { $ret=[System.TimeZoneInfo]::ConvertTimeFromUtc($v, $tz); Write-Log ("Convert-ToJst: {0} OUT {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret }
     else               { $ret=$v.AddHours(9); Write-Log ("Convert-ToJst: {0} OUT(+9h fallback) {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret }
   } catch {
-    Write-Log ("Convert-ToJst: Exception → +9h fallback. " + $_.Exception.Message)
+    Write-Log ("Convert-ToJst: Exception → +9h fallback. " + (Get-ErrMsg $_))
     try { $ret=$dt.Value.AddHours(9); Write-Log ("Convert-ToJst: {0} OUT(+9h after err) {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret } catch { return $dt }
   }
 }
 
-# ===== 補助 =====
+# ===== テキスト補助 =====
 function HtmlEscape { param([string]$s) if ($null -eq $s) { return '' }
   $r=$s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;').Replace("'",'&#39;'); return $r
 }
@@ -125,14 +129,56 @@ function Get-ParentOrCwd { param([string]$PathLike)
   if ([string]::IsNullOrWhiteSpace($dir)) { try { return (Get-Location).Path } catch { return "." } }
   return $dir
 }
+function Normalize-WS { param([string]$s)
+  if ($null -eq $s) { return $s }
+  $s = $s.Replace([char]0x00A0,' ')
+  $s = $s.Replace([char]0x2007,' ')
+  $s = $s.Replace([char]0x202F,' ')
+  $s = $s.Trim()
+  $s = ($s -replace '\s+',' ')
+  return $s
+}
 
-# ===== 数値/時刻抽出 =====
+# ===== AP名クレンジング & ログ =====
+function Is-BadAPToken { param([string]$tok)
+  if ([string]::IsNullOrWhiteSpace($tok)) { return $true }
+  $t=$tok.ToLower()
+  foreach($x in @('radio','stats','radio-stats','radio_stats','show','debug','output','log','arm','history','ap','apname','stat')){
+    if ($t -eq $x) { return $true }
+  }
+  if ($t.Length -le 2) { return $true }
+  return $false
+}
+function Clean-APLeaf { param([string]$leaf,[string]$context)
+  if ([string]::IsNullOrWhiteSpace($leaf)) { return '' }
+  $orig=$leaf
+  $base=$leaf
+  # 拡張子除去
+  try { $base=[System.IO.Path]::GetFileNameWithoutExtension($base) } catch {}
+  # よく出る接頭辞/語を除去（単語境界考慮）
+  $base = ($base -replace '(?i)\b(show|ap|debug|radio|stats?|output|log|arm|history)\b',' ').Trim()
+  $base = ($base -replace '[_\-\.\s]+',' ')
+  $parts = @(); if (-not [string]::IsNullOrWhiteSpace($base)) { $parts = $base.Split(' ') }
+  Write-Log ("AP Clean: leaf='{0}' base='{1}' parts='{2}' ctx='{3}'" -f $orig,$base,([string]::Join('|',$parts)),$context)
+  $cands=@()
+  foreach($p in $parts){
+    if (-not (Is-BadAPToken $p)) { $cands += $p }
+  }
+  if ($cands.Count -gt 0) {
+    # 最長候補を採用
+    $best=$cands[0]
+    for($i=1;$i -lt $cands.Count;$i++){ if($cands[$i].Length -gt $best.Length){ $best=$cands[$i] } }
+    Write-Log ("AP Clean: choose='{0}'" -f $best)
+    return $best
+  }
+  return ''
+}
+
+# ===== 数値/Busy抽出 =====
 function Get-LastNumber { param([string]$Line)
   if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
   $m=[regex]::Matches($Line,'(-?\d+(?:\.\d+)?)'); if($m.Count -gt 0){ return [double]$m[$m.Count-1].Value } return $null
 }
-
-# Busy 1s/4s/64s
 function TryExtractPercentTriplet {
   param([string]$Line,[ref]$Busy1s,[ref]$Busy4s,[ref]$Busy64s)
   $ok=$false
@@ -145,43 +191,49 @@ function TryExtractPercentTriplet {
   return $false
 }
 
-# Output Time を UTC として取り出す（内部でログ）
+# ===== Output Time (UTC) 抽出 =====
 function Extract-OutputTime {
   param([string[]]$Lines,[string]$Path)
   if ($Lines -eq $null -or $Lines.Count -eq 0) { return $null }
   foreach ($raw in $Lines) {
     $line = ($raw -replace '\r','').Trim()
     if ($line -match '(?i)Output\s*Time\s*[:=]\s*(.+)$') {
-      $rhs = $Matches[1].Trim()
-      Write-Log ("OutputTime: Path='{0}' RawLine='{1}' Rhs='{2}'" -f $Path,$line,$rhs)
+      $rhsRaw = $Matches[1]
+      $rhs = Normalize-WS $rhsRaw
+      Write-Log ("OutputTime: Path='{0}' RawLine='{1}' Rhs(norm)='{2}'" -f $Path,$line,$rhs)
 
-      # 1) "YYYY-MM-DD HH:mm:ss UTC"
-      $mUtc=[regex]::Match($rhs,'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+      $mUtc=[regex]::Match($rhs,'^(\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
       if($mUtc.Success){
         try{
-          $dt=[DateTime]::Parse($mUtc.Groups[1].Value,[System.Globalization.CultureInfo]::InvariantCulture)
-          $ret=[DateTime]::SpecifyKind($dt,[System.DateTimeKind]::Utc)
-          Write-Log ("OutputTime: match=UTC-text parsed={0}" -f ((ToLogStr-DT $ret "utc")))
-          return $ret
-        }catch{ Write-Log ("OutputTime: parse err (UTC-text) " + $_.Exception.Message) }
+          $ts=$mUtc.Groups[1].Value
+          $dtOut=[DateTime]::MinValue
+          $ok=[DateTime]::TryParseExact($ts, @('yyyy-MM-dd HH:mm:ss','yyyy-MM-dd''T''HH:mm:ss','yyyy/MM/dd HH:mm:ss','yyyy/MM/dd''T''HH:mm:ss'),
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None,
+                    [ref]$dtOut)
+          if($ok){
+            $ret=[DateTime]::SpecifyKind($dtOut,[System.DateTimeKind]::Utc)
+            Write-Log ("OutputTime: match=UTC-text parsed {0}" -f ((ToLogStr-DT $ret "utc")))
+            return $ret
+          } else {
+            Write-Log ("OutputTime: UTC-text matched but ParseExact failed for '{0}'" -f $ts)
+          }
+        }catch{ Write-Log ("OutputTime: parse err (UTC-text): " + (Get-ErrMsg $_)) }
       }
 
-      # 2) epoch 秒/ミリ秒
       if ($rhs -match '^\d{10}(\.\d+)?$') {
-        try { $sec=[long]([double]$rhs); $ret=([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime; Write-Log ("OutputTime: match=epoch-seconds parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log "OutputTime: epoch-seconds parse err" }
+        try { $sec=[long]([double]$rhs); $ret=([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime; Write-Log ("OutputTime: match=epoch-seconds parsed {0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log ("OutputTime: epoch-seconds parse err: " + (Get-ErrMsg $_)) }
       }
       if ($rhs -match '^\d{13}$') {
-        try { $ms=[long]$rhs; $ret=([System.DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime; Write-Log ("OutputTime: match=epoch-millis parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log "OutputTime: epoch-millis parse err" }
+        try { $ms=[long]$rhs; $ret=([System.DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime; Write-Log ("OutputTime: match=epoch-millis parsed {0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log ("OutputTime: epoch-millis parse err: " + (Get-ErrMsg $_)) }
       }
 
-      # 3) ISO8601 with offset/Z
       $dto=[System.DateTimeOffset]::MinValue
       if ([System.DateTimeOffset]::TryParse($rhs,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::AssumeUniversal,[ref]$dto)) {
-        $ret=$dto.UtcDateTime; Write-Log ("OutputTime: match=iso8601 parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret
+        $ret=$dto.UtcDateTime; Write-Log ("OutputTime: match=iso8601 parsed {0}" -f ((ToLogStr-DT $ret "utc"))); return $ret
       }
 
-      # 4) 最後の手段：UTC と仮定
-      try { $dt2=[DateTime]::Parse($rhs,[System.Globalization.CultureInfo]::InvariantCulture); $ret=[DateTime]::SpecifyKind($dt2,[System.DateTimeKind]::Utc); Write-Log ("OutputTime: match=fallback parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log ("OutputTime: all patterns failed") }
+      try { $dt2=[DateTime]::Parse($rhs,[System.Globalization.CultureInfo]::InvariantCulture); $ret=[DateTime]::SpecifyKind($dt2,[System.DateTimeKind]::Utc); Write-Log ("OutputTime: match=fallback parsed {0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log ("OutputTime: all patterns failed: " + (Get-ErrMsg $_)) }
     }
   }
   Write-Log ("OutputTime: not found in '{0}'" -f $Path)
@@ -202,43 +254,62 @@ function Is-RadioStatsLines { param([string[]]$Lines)
   return $false
 }
 
-# ===== AP名推定/補正（省略：前版と同一） =====
+# ===== AP名 推定（ログ込み） =====
 function Guess-APName { param([string[]]$Lines,[string]$Path)
+  Write-Log ("AP Guess: start path='{0}'" -f $Path)
+
   foreach ($raw in $Lines) {
     $line = ($raw -replace '\r','').Trim()
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($m1.Success){ return $m1.Groups[1].Value }
-    $m2=[regex]::Match($line,'^\s*([A-Za-z0-9][A-Za-z0-9_\-\.:\(\)\/\\]+)\s*[#>]\s*'); if($m2.Success){ return $m2.Groups[1].Value }
-    $m3=[regex]::Match($line,'(?i)\bAP\s*[:=]\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($m3.Success){ return $m3.Groups[1].Value }
+    $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)')
+    if($m1.Success){
+      $v=$m1.Groups[1].Value; Write-Log ("AP Guess: from 'AP Name:' -> '{0}'" -f $v)
+      return $v
+    }
+    $m2=[regex]::Match($line,'^\s*([A-Za-z0-9][A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)\s*[#>]\s*')
+    if($m2.Success){
+      $v=$m2.Groups[1].Value; Write-Log ("AP Guess: from prompt -> '{0}'" -f $v)
+      return $v
+    }
+    $m3=[regex]::Match($line,'(?i)\bAP\s*[:=]\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)')
+    if($m3.Success){
+      $v=$m3.Groups[1].Value; Write-Log ("AP Guess: from 'AP:' -> '{0}'" -f $v)
+      return $v
+    }
   }
-  $leaf=$null; try{ $leaf=[System.IO.Path]::GetFileNameWithoutExtension($Path) }catch{}
-  if (-not [string]::IsNullOrWhiteSpace($leaf)) {
-    $cand = ($leaf -replace '(?i)show|ap|debug|radio|stats|stat|output|log|arm|history','' -replace '[_\-\.\s]+$','' -replace '^\s+','').Trim()
-    if ($cand -match '^[A-Za-z0-9].+') { return $cand }
-  }
+
+  $leaf=$null; try{ $leaf=[System.IO.Path]::GetFileName($Path) }catch{}
+  $clean = Clean-APLeaf -leaf $leaf -context "filename"
+  if (-not [string]::IsNullOrWhiteSpace($clean)) { Write-Log ("AP Guess: from filename cleaned -> '{0}'" -f $clean); return $clean }
+
   $p=$null; try{ $p=Split-Path -Path $Path -Parent }catch{}
   if (-not [string]::IsNullOrWhiteSpace($p)) {
     $dirLeaf=$null; try{ $dirLeaf=Split-Path -Path $p -Leaf }catch{}
-    if (-not [string]::IsNullOrWhiteSpace($dirLeaf)) { return $dirLeaf }
+    $clean2 = Clean-APLeaf -leaf $dirLeaf -context "dirname"
+    if (-not [string]::IsNullOrWhiteSpace($clean2)) { Write-Log ("AP Guess: from dirname cleaned -> '{0}'" -f $clean2); return $clean2 }
   }
+
+  Write-Log ("AP Guess: failed -> ''")
   return ''
 }
+
 function Fix-AP-From-Backup { param([string]$ap,[string]$path,[hashtable]$Backup)
-  if ($Backup -eq $null -or $Backup.Keys.Count -eq 0) { return $ap }
-  if (-not [string]::IsNullOrWhiteSpace($ap) -and $Backup.ContainsKey($ap)) { return $ap }
+  if ($Backup -eq $null -or $Backup.Keys.Count -eq 0) { Write-Log ("AP Fix: no backup map; keep '{0}'" -f $ap); return $ap }
+  if (-not [string]::IsNullOrWhiteSpace($ap) -and $Backup.ContainsKey($ap)) { Write-Log ("AP Fix: exact match in backup '{0}'" -f $ap); return $ap }
   $leaf=''; try{ $leaf=[System.IO.Path]::GetFileName($path) }catch{}
   $full=$path
   foreach ($k in $Backup.Keys) {
     if (-not [string]::IsNullOrWhiteSpace($k)) {
-      if ($leaf -and ($leaf -like "*$k*")) { return $k }
-      if ($full -and ($full -like "*$k*")) { return $k }
+      if ($leaf -and ($leaf -like "*$k*")) { Write-Log ("AP Fix: matched by leaf contains '{0}'" -f $k); return $k }
+      if ($full -and ($full -like "*$k*")) { Write-Log ("AP Fix: matched by path contains '{0}'" -f $k); return $k }
     }
   }
-  if ($Backup.Keys.Count -eq 1) { foreach($k in $Backup.Keys){ return $k } }
+  if ($Backup.Keys.Count -eq 1) { foreach($k in $Backup.Keys){ Write-Log ("AP Fix: single backup key -> '{0}'" -f $k); return $k } }
+  Write-Log ("AP Fix: keep '{0}'" -f $ap)
   return $ap
 }
 
-# ===== バンド判定/バックアップ取り込み（省略：前版と同一） =====
+# ===== Band/Channel 補助 =====
 function Get-BandFromChannel { param([Nullable[int]]$Channel)
   if ($Channel -eq $null) { return '' }
   $ch=[int]$Channel
@@ -260,7 +331,9 @@ function Map-PhyType-To-Band { param([string]$s)
   if ($t -match '2\.4ghz' -or $t -match '\b2g\b' -or $t -match '\b11b\b' -or $t -match '\b11g\b') { return '2.4GHz' }
   return ''
 }
+
 function New-BackupSlot { return New-Object psobject -Property @{ Ch24=$null; T24=$null; Ch5=$null; T5=$null; Ch6=$null; T6=$null } }
+
 function Detect-Band-Token { param([string]$line,[Nullable[int]]$ch)
   $s=$line.ToLower()
   if ($s -match '6ghz' -or $s -match '\b6g\b' -or $s -match '6e') { return '6GHz' }
@@ -269,20 +342,24 @@ function Detect-Band-Token { param([string]$line,[Nullable[int]]$ch)
   if ($ch -ne $null) { return (Get-BandFromChannel $ch) }
   return ''
 }
+
 function Update-Backup { param([hashtable]$Backup,[string]$ap,[string]$band,[Nullable[int]]$ch,[Nullable[DateTime]]$ts)
   if ([string]::IsNullOrWhiteSpace($ap) -or [string]::IsNullOrWhiteSpace($band) -or $ch -eq $null) { return }
   if (-not $Backup.ContainsKey($ap)) { $Backup[$ap] = New-BackupSlot }
   $slot = $Backup[$ap]
-  if     ($band -eq '2.4GHz') { if ($slot.T24 -eq $null -or ($ts -ne $null -and $ts -gt $slot.T24)) { $slot.Ch24=[int]$ch; $slot.T24=$ts } }
-  elseif ($band -eq '5GHz')   { if ($slot.T5  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T5 )) { $slot.Ch5 =[int]$ch; $slot.T5 =$ts } }
-  elseif ($band -eq '6GHz')   { if ($slot.T6  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T6 )) { $slot.Ch6 =[int]$ch; $slot.T6 =$ts } }
+  if     ($band -eq '2.4GHz') { if ($slot.T24 -eq $null -or ($ts -ne $null -and $ts -gt $slot.T24)) { $slot.Ch24=[int]$ch; $slot.T24=$ts; Write-Log ("Backup Update: AP='{0}' Band=2.4GHz Ch={1} ts={2}" -f $ap,$ch,$ts) } }
+  elseif ($band -eq '5GHz')   { if ($slot.T5  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T5 )) { $slot.Ch5 =[int]$ch; $slot.T5 =$ts; Write-Log ("Backup Update: AP='{0}' Band=5GHz Ch={1} ts={2}"  -f $ap,$ch,$ts) } }
+  elseif ($band -eq '6GHz')   { if ($slot.T6  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T6 )) { $slot.Ch6 =[int]$ch; $slot.T6 =$ts; Write-Log ("Backup Update: AP='{0}' Band=6GHz Ch={1} ts={2}"  -f $ap,$ch,$ts) } }
 }
+
+# ===== バックアップファイルパース（ログ強化） =====
 function Parse-BssTable-File { param([string]$Path,[hashtable]$Backup)
+  Write-Log ("Backup Parse: BSS-Table '{0}'" -f $Path)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ return }
   foreach ($raw in $lines) {
     $line=($raw -replace '\r','').Trim(); if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $ap=''; $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($m1.Success){ $ap=$m1.Groups[1].Value }
+    $ap=''; $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)'); if($m1.Success){ $ap=$m1.Groups[1].Value }
     if ([string]::IsNullOrWhiteSpace($ap)) { $m2=[regex]::Match($line,'(?i)\bAP-?Name\b[:=]?\s*([^\s,]+)'); if($m2.Success){ $ap=$m2.Groups[1].Value } }
     if ([string]::IsNullOrWhiteSpace($ap)) {
       if ($line -match '(?i)\bch(annel)?\b' -or $line -match '(?i)\bssid\b' -or $line -match '(?i)\bbssid\b') {
@@ -299,14 +376,15 @@ function Parse-BssTable-File { param([string]$Path,[hashtable]$Backup)
   }
 }
 function Parse-APS-File { param([string]$Path,[hashtable]$Backup)
+  Write-Log ("Backup Parse: APS '{0}'" -f $Path)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ return }
   $currentAP=''
   foreach ($raw in $lines) {
     $line=($raw -replace '\r','').Trim(); if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $mHead=[regex]::Match($line,'(?i)^(Name|AP\s*Name)\s*[:=]?\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($mHead.Success){ $currentAP=$mHead.Groups[2].Value }
-    $mInline=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($mInline.Success){ $currentAP=$mInline.Groups[1].Value }
-    if ([string]::IsNullOrWhiteSpace($currentAP)) { $parts=$line -split '\s+'; if ($parts.Length -ge 1 -and $parts[0] -match '^[A-Za-z0-9_\-\.:\(\)\/\\]+$'){ $currentAP=$parts[0] } }
+    $mHead=[regex]::Match($line,'(?i)^(Name|AP\s*Name)\s*[:=]?\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)'); if($mHead.Success){ $currentAP=$mHead.Groups[2].Value; Write-Log ("APS: AP='{0}' (header)" -f $currentAP) }
+    $mInline=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)'); if($mInline.Success){ $currentAP=$mInline.Groups[1].Value; Write-Log ("APS: AP='{0}' (inline)" -f $currentAP) }
+    if ([string]::IsNullOrWhiteSpace($currentAP)) { $parts=$line -split '\s+'; if ($parts.Length -ge 1 -and $parts[0] -match '^[A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+$'){ $currentAP=$parts[0]; Write-Log ("APS: AP='{0}' (first token)" -f $currentAP) } }
     if ([string]::IsNullOrWhiteSpace($currentAP)) { continue }
     $mR=[regex]::Match($line,'(?i)\bRadio\s*([012])\s*.*?\bChannel\s*[:=]\s*(\d{1,3})')
     if($mR.Success){
@@ -318,16 +396,17 @@ function Parse-APS-File { param([string]$Path,[hashtable]$Backup)
   }
 }
 function Parse-RadioInfo-File { param([string]$Path,[hashtable]$Backup)
+  Write-Log ("Backup Parse: Radio-Info '{0}'" -f $Path)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ return }
   $ap=''; foreach ($raw in $lines) {
     $line=($raw -replace '\r','').Trim()
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:\(\)\/\\]+)'); if($m1.Success){ $ap=$m1.Groups[1].Value; break }
+    $m1=[regex]::Match($line,'(?i)\bAP\s*Name\s*[:=]\s*([A-Za-z0-9_\-\.:$begin:math:text$$end:math:text$\/\\]+)'); if($m1.Success){ $ap=$m1.Groups[1].Value; Write-Log ("Radio-Info: AP='{0}'" -f $ap); break }
   }
   if ([string]::IsNullOrWhiteSpace($ap)) {
     $leaf=$null; try{ $leaf=[System.IO.Path]::GetFileNameWithoutExtension($Path) }catch{}
-    if (-not [string]::IsNullOrWhiteSpace($leaf)) { $ap=$leaf }
+    if (-not [string]::IsNullOrWhiteSpace($leaf)) { $ap=Clean-APLeaf -leaf $leaf -context "radio-info"; if(-not [string]::IsNullOrWhiteSpace($ap)){ Write-Log ("Radio-Info: AP from filename -> '{0}'" -f $ap) } }
   }
   $curRadio=''
   foreach ($raw in $lines) {
@@ -342,15 +421,16 @@ function Parse-RadioInfo-File { param([string]$Path,[hashtable]$Backup)
   }
 }
 function Parse-ARMHistory-File { param([string]$Path,[hashtable]$Backup)
+  Write-Log ("Backup Parse: ARM-History '{0}'" -f $Path)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ return }
   $ap = Guess-APName -Lines $lines -Path $Path
-  if ([string]::IsNullOrWhiteSpace($ap)) { $leaf=$null; try{ $leaf=[System.IO.Path]::GetFileNameWithoutExtension($Path) }catch{}; if (-not [string]::IsNullOrWhiteSpace($leaf)) { $ap=$leaf } }
+  if ([string]::IsNullOrWhiteSpace($ap)) { $leaf=$null; try{ $leaf=[System.IO.Path]::GetFileNameWithoutExtension($Path) }catch{}; if (-not [string]::IsNullOrWhiteSpace($leaf)) { $ap=Clean-APLeaf -leaf $leaf -context "arm"; if(-not [string]::IsNullOrWhiteSpace($ap)){ Write-Log ("ARM: AP from filename -> '{0}'" -f $ap) } } }
   $curBand=''
   foreach ($raw in $lines) {
     $line = ($raw -replace '\r','').Trim()
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $mPhy=[regex]::Match($line,'(?i)\bPhy[-\s]?Type\s*[:=]\s*([A-Za-z0-9\.]+)'); if($mPhy.Success){ $b = Map-PhyType-To-Band $mPhy.Groups[1].Value; if (-not [string]::IsNullOrWhiteSpace($b)) { $curBand = $b } }
+    $mPhy=[regex]::Match($line,'(?i)\bPhy[-\s]?Type\s*[:=]\s*([A-Za-z0-9\.]+)'); if($mPhy.Success){ $b = Map-PhyType-To-Band $mPhy.Groups[1].Value; if (-not [string]::IsNullOrWhiteSpace($b)) { $curBand = $b; Write-Log ("ARM: AP='{0}' BandHint='{1}'" -f $ap,$curBand) } }
     if ($line -match '(?i)\binterface\s*[:=]\s*([A-Za-z0-9_\-\.]+)') { $null = $Matches[1] }
     $ch=$null
     $mCh1=[regex]::Match($line,'(?i)\bChannel\s*[:=]\s*(\d{1,3})\b')
@@ -370,11 +450,13 @@ function Parse-ARMHistory-File { param([string]$Path,[hashtable]$Backup)
     }
   }
 }
+
 function Build-Backup-From-Dirs { param([string[]]$Dirs)
   $bk=@{}; if ($Dirs -eq $null) { return $bk }
   foreach ($d in $Dirs) {
     if ([string]::IsNullOrWhiteSpace($d)) { continue }
     if (-not (Test-Path -LiteralPath $d)) { continue }
+    Write-Log ("Backup scan dir: {0}" -f $d)
     $files=@(); try{ $files=Get-ChildItem -LiteralPath $d -File -ErrorAction Stop }catch{ $files=@() }
     foreach ($f in $files) {
       $name=$f.Name.ToLower()
@@ -392,6 +474,8 @@ function Build-Backup-From-Dirs { param([string[]]$Dirs)
           if (($ls -match 'phy' -and $ls -match 'type') -or ($ls -match 'interface:' -and $ls -match 'wifi')) { $isARM=$true; break }
         }
       }
+      $klass='other'; if($isBss){$klass='bss'}elseif($isAPS){$klass='aps'}elseif($isRInfo){$klass='rinfo'}elseif($isARM){$klass='arm'}
+      Write-Log ("Backup classify: file='{0}' class={1}" -f $f.Name,$klass)
       if     ($isBss)   { Parse-BssTable-File   -Path $f.FullName -Backup $bk }
       elseif ($isAPS)   { Parse-APS-File       -Path $f.FullName -Backup $bk }
       elseif ($isRInfo) { Parse-RadioInfo-File -Path $f.FullName -Backup $bk }
@@ -401,12 +485,13 @@ function Build-Backup-From-Dirs { param([string[]]$Dirs)
   return $bk
 }
 
-# ===== radio-stats パーサ =====
+# ===== radio-stats パーサ（Channel 直接取得＋ログ） =====
 function Parse-RadioStatsFile {
   param([string]$Path)
 
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ $lines=@() }
   if (-not (Is-RadioStatsLines -Lines $lines)) {
+    Write-Log ("Parse-RadioStatsFile: not radio-stats '{0}'" -f $Path)
     return New-Object psobject -Property @{ Path=$Path; OutputTime=$null; Data=@{}; IsRadio=$false }
   }
 
@@ -426,6 +511,7 @@ function Parse-RadioStatsFile {
         BusyBeacon=$null; TxBeacon=$null; RxBeacon=$null;
         CCA_Our=$null; CCA_Other=$null; CCA_Interference=$null
       }
+      Write-Log ("Parse-RadioStatsFile: init slot AP='{0}' Radio='{1}'" -f $apName,$r)
     } else {
       if ([string]::IsNullOrWhiteSpace($data[$rk].AP) -and -not [string]::IsNullOrWhiteSpace($apName)) { $data[$rk].AP=$apName }
     }
@@ -442,6 +528,18 @@ function Parse-RadioStatsFile {
     }
     if ([string]::IsNullOrWhiteSpace($currentRadio)) { $currentRadio='0' }
     $obj = & $ensure $currentRadio
+
+    # Channel を本文から直接取得（Channel Changes を除外）
+    if ($line -notmatch '(?i)Channel\s+Changes') {
+      $mCh1=[regex]::Match($line,'(?i)\bCurrent\s*Channel\s*[:=]\s*(\d{1,3})\b')
+      $mCh2=[regex]::Match($line,'(?i)\bChannel\s*[:=]\s*(\d{1,3})\b')
+      if ($mCh1.Success -or $mCh2.Success) {
+        $val = $null
+        if ($mCh1.Success) { try { $val=[int]$mCh1.Groups[1].Value } catch {} }
+        if ($val -eq $null -and $mCh2.Success) { try { $val=[int]$mCh2.Groups[1].Value } catch {} }
+        if ($val -ne $null) { $obj.Channel=$val; Write-Log ("Parse-RadioStatsFile: Channel from body AP='{0}' Radio='{1}' Ch={2}" -f $apName,$currentRadio,$val) }
+      }
+    }
 
     if ($line -match '(?i)\bRx\s*retry\s*frames?\b')  { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxRetry=[double]$n } }
     if ($line -match '(?i)\bRx\s*CRC\s*Errors?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxCRC  =[double]$n } }
@@ -462,7 +560,7 @@ function Parse-RadioStatsFile {
       }
     }
 
-    if ($line -match '(?i)\bBusy\s*\(?\s*Beacon\s*\)?') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.BusyBeacon=[double]$n } }
+    if ($line -match '(?i)\bBusy\s*$begin:math:text$?\\s*Beacon\\s*$end:math:text$?') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.BusyBeacon=[double]$n } }
     if ($line -match '(?i)\bTx\s*Beacon\b')             { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxBeacon=[double]$n } }
     if ($line -match '(?i)\bRx\s*Beacon\b')             { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxBeacon=[double]$n } }
 
@@ -589,6 +687,7 @@ foreach ($seg in $segments) {
 $dirList=@(); foreach ($d in $dirs) { $dirList += $d }
 Write-Log ("Backup scan dirs: " + ($dirList -join ';'))
 $BackupMap = Build-Backup-From-Dirs -Dirs $dirList
+Write-Log ("Backup keys: " + ([string]::Join(',', $BackupMap.Keys)))
 
 # ===== CSV 出力先 =====
 if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
@@ -628,7 +727,7 @@ $colDefs = @(
 $csvHeader = ($colDefs | ForEach-Object { $_[0] }) -join ','
 Set-Content -LiteralPath $OutputCsv -Value $csvHeader -Encoding UTF8
 
-# ===== 診断 =====
+# ===== 診断（簡易スコア） =====
 function Make-Diagnosis {
   param(
     [double]$Busy64,[double]$BusyB,[double]$TxB,[double]$RxB,
@@ -692,11 +791,6 @@ function Make-Diagnosis {
     $sev='sev-warn'
   }
 
-  if($root -ne 'inter' -and ($scoreInter -gt 0)){ $secList.Add((Sanitize-Text ("副次：非Wi-Fi干渉の疑い（Interference "+([int]$CCAI)+"%、PLCP "+([int]$PLCP)+"/s）"))) }
-  if($root -ne 'co'   -and ($scoreCoch -gt 0)){ $secList.Add((Sanitize-Text ("副次：同一チャネル混在（他BSS "+([int]$CCAO)+"%、ΔCCA "+([int]$deltaCCA)+"pt、Busy64 "+([int]$Busy64)+"%）"))) }
-  if($root -ne 'qual' -and ($scoreQual -gt 0)){ $secList.Add((Sanitize-Text ("副次：端末側の品質低下（Retry "+([int]$Retry)+"/s、CRC "+([int]$CRC)+"/s）"))) }
-  if($root -ne 'busy' -and ($scoreBusy -gt 0)){ $secList.Add((Sanitize-Text ("副次：混雑（Busy64 "+([int]$Busy64)+"%）"))) }
-
   $band = Get-BandFromChannel -Channel $Channel
   $laaHit=$false
   if ($band -eq '5GHz') {
@@ -722,7 +816,7 @@ function Diff-NonNegative { param([double]$After,[double]$Before)
   return $d
 }
 
-# ===== 集計・HTML/CSV 出力 =====
+# ===== 集計/出力（Channel/Band 由来をログ） =====
 $rows=@()
 $cards=@()
 $hourBuckets=@{}
@@ -758,7 +852,9 @@ foreach ($seg in $segments) {
     if ([string]::IsNullOrWhiteSpace($ap) -and $b -ne $null) { $ap=$b.AP }
     if ([string]::IsNullOrWhiteSpace($radio) -and $b -ne $null) { $radio=$b.Radio }
 
+    $origAp=$ap
     $ap = Fix-AP-From-Backup -ap $ap -path $seg.After.Path -Backup $BackupMap
+    if ($origAp -ne $ap) { Write-Log ("Row: AP fixed '{0}' -> '{1}'" -f $origAp,$ap) }
 
     $dRetry = Diff-NonNegative $a.RxRetry $b.RxRetry
     $dCRC   = Diff-NonNegative $a.RxCRC   $b.RxCRC
@@ -786,33 +882,35 @@ foreach ($seg in $segments) {
     $chan   = Pick-AfterFirst $a.Channel $b.Channel
     $band   = Get-BandFromChannel -Channel $chan
 
+    if ($chan -ne $null) { Write-Log ("Row: Channel from after/before -> {0} (AP='{1}', Radio='{2}')" -f $chan,$ap,$radio) }
+
     if (-not [string]::IsNullOrWhiteSpace($ap) -and $BackupMap.ContainsKey($ap)) {
       $slot = $BackupMap[$ap]
       if ($chan -eq $null) {
         $targetBand=$band; if ([string]::IsNullOrWhiteSpace($targetBand)) { $targetBand=Guess-Band-From-RadioIndex $radio }
-        if     ($targetBand -eq '2.4GHz' -and $slot.Ch24 -ne $null) { $chan=[int]$slot.Ch24 }
-        elseif ($targetBand -eq '5GHz'   -and $slot.Ch5  -ne $null) { $chan=[int]$slot.Ch5 }
-        elseif ($targetBand -eq '6GHz'   -and $slot.Ch6  -ne $null) { $chan=[int]$slot.Ch6 }
+        if     ($targetBand -eq '2.4GHz' -and $slot.Ch24 -ne $null) { $chan=[int]$slot.Ch24; Write-Log ("Row: Channel from backup 2.4 -> {0} (AP='{1}')" -f $chan,$ap) }
+        elseif ($targetBand -eq '5GHz'   -and $slot.Ch5  -ne $null) { $chan=[int]$slot.Ch5 ; Write-Log ("Row: Channel from backup 5 -> {0} (AP='{1}')"   -f $chan,$ap) }
+        elseif ($targetBand -eq '6GHz'   -and $slot.Ch6  -ne $null) { $chan=[int]$slot.Ch6 ; Write-Log ("Row: Channel from backup 6 -> {0} (AP='{1}')"   -f $chan,$ap) }
         else {
           $count=0;$last=''; if($slot.Ch24 -ne $null){$count++;$last='2.4GHz'}; if($slot.Ch5 -ne $null){$count++;$last='5GHz'}; if($slot.Ch6 -ne $null){$count++;$last='6GHz'}
-          if ($count -eq 1) { if($last -eq '2.4GHz'){$chan=[int]$slot.Ch24}elseif($last -eq '5GHz'){$chan=[int]$slot.Ch5}else{$chan=[int]$slot.Ch6}; $band=$last }
+          if ($count -eq 1) { if($last -eq '2.4GHz'){$chan=[int]$slot.Ch24}elseif($last -eq '5GHz'){$chan=[int]$slot.Ch5}else{$chan=[int]$slot.Ch6}; $band=$last; Write-Log ("Row: Channel from backup unique band -> {0} ({1}) AP='{2}'" -f $chan,$band,$ap) }
         }
       }
       if ([string]::IsNullOrWhiteSpace($band)) {
-        if ($chan -ne $null) { $band=Get-BandFromChannel $chan }
+        if ($chan -ne $null) { $band=Get-BandFromChannel $chan; if(-not [string]::IsNullOrWhiteSpace($band)){ Write-Log ("Row: Band from channel -> {0} (AP='{1}')" -f $band,$ap) } }
         if ([string]::IsNullOrWhiteSpace($band)) {
-          if ($slot.Ch24 -ne $null -and $slot.Ch5 -eq $null -and $slot.Ch6 -eq $null) { $band='2.4GHz' }
-          elseif ($slot.Ch5 -ne $null -and $slot.Ch24 -eq $null -and $slot.Ch6 -eq $null) { $band='5GHz' }
-          elseif ($slot.Ch6 -ne $null -and $slot.Ch24 -eq $null -and $slot.Ch5 -eq $null) { $band='6GHz' }
+          if ($slot.Ch24 -ne $null -and $slot.Ch5 -eq $null -and $slot.Ch6 -eq $null) { $band='2.4GHz'; Write-Log ("Row: Band from backup only 2.4 (AP='{0}')" -f $ap) }
+          elseif ($slot.Ch5 -ne $null -and $slot.Ch24 -eq $null -and $slot.Ch6 -eq $null) { $band='5GHz'; Write-Log ("Row: Band from backup only 5 (AP='{0}')" -f $ap) }
+          elseif ($slot.Ch6 -ne $null -and $slot.Ch24 -eq $null -and $slot.Ch5 -eq $null) { $band='6GHz'; Write-Log ("Row: Band from backup only 6 (AP='{0}')" -f $ap) }
         }
       }
       if ($chan -eq $null -and -not [string]::IsNullOrWhiteSpace($band)) {
-        if ($band -eq '2.4GHz' -and $slot.Ch24 -ne $null) { $chan=[int]$slot.Ch24 }
-        if ($band -eq '5GHz'   -and $slot.Ch5  -ne $null) { $chan=[int]$slot.Ch5 }
-        if ($band -eq '6GHz'   -and $slot.Ch6  -ne $null) { $chan=[int]$slot.Ch6 }
+        if ($band -eq '2.4GHz' -and $slot.Ch24 -ne $null) { $chan=[int]$slot.Ch24; Write-Log ("Row: Channel filled by band=2.4 -> {0} (AP='{1}')" -f $chan,$ap) }
+        if ($band -eq '5GHz'   -and $slot.Ch5  -ne $null) { $chan=[int]$slot.Ch5 ; Write-Log ("Row: Channel filled by band=5   -> {0} (AP='{1}')" -f $chan,$ap) }
+        if ($band -eq '6GHz'   -and $slot.Ch6  -ne $null) { $chan=[int]$slot.Ch6 ; Write-Log ("Row: Channel filled by band=6   -> {0} (AP='{1}')" -f $chan,$ap) }
       }
     }
-    if ([string]::IsNullOrWhiteSpace($band) -and $chan -ne $null) { $band=Get-BandFromChannel $chan }
+    if ([string]::IsNullOrWhiteSpace($band) -and $chan -ne $null) { $band=Get-BandFromChannel $chan; if(-not [string]::IsNullOrWhiteSpace($band)){ Write-Log ("Row: Band final from channel -> {0}" -f $band) } }
 
     $hasAny=$false
     foreach($vv in @($retry_ps,$crc_ps,$plcp_ps,$chg_ph,$txp_ph,$busy1s,$busy4s,$busy64,$busyB,$txB,$rxB,$ccaO,$ccaOt,$ccaI,$chan)){
@@ -861,7 +959,7 @@ foreach ($seg in $segments) {
 
 Write-Output ("CSV : {0}" -f $OutputCsv)
 
-# ===== HTML =====
+# ===== HTML（同） =====
 if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
   $baseRef=$OutputHtml
   $outDir=Get-ParentOrCwd -PathLike $baseRef
