@@ -1,12 +1,13 @@
-
-# ---- Helper: Ensure-RadioSlot (top-level) ----
-function Ensure-RadioSlot {
-  param(
+param(
     [hashtable]$Data,
     [string]$ApName,
     [string]$Radio
   )
-  if ($null -eq $Data) { $Data = @{} }
+
+
+# ---- Helper: Ensure-RadioSlot (top-level) ----
+function Ensure-RadioSlot {
+    if ($null -eq $Data) { $Data = @{} }
   $rk = ($ApName + '|' + $Radio)
   if (-not $Data.ContainsKey($rk)) {
     $Data[$rk] = New-Object psobject -Property @{
@@ -45,8 +46,6 @@ function Ensure-RadioSlot {
     - DurationSec が短すぎる（<30s）場合はファイル時刻などで補正、最終的に 900s へフォールバック
     - SafeRate: /s 換算が 100,000/s 超になる異常値は無効化（空欄）しログ出力
 #>
-
-[CmdletBinding()]
 param(
   [string]$BeforeFile,
   [string]$AfterFile,
