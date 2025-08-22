@@ -42,10 +42,30 @@ $TH_LAA_MinBusy   = 35
 # ===== ログ基盤 =====
 $Script:LogPath = $null
 function Write-Log { param([string]$Msg)
+  # generic logger
+
   if ([string]::IsNullOrWhiteSpace($Script:LogPath)) { return }
   $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffK"
   $line = "[{0}] {1}" -f $ts, $Msg
   try { Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8 } catch {}
+}
+
+function Write-ParseStat {
+  param([string]$AP,[string]$Radio,[string]$Field,[Nullable[double]]$Value,[string]$Path,[string]$LineSample)
+  try {
+    $valTxt = $(if ($Value -ne $null) { [string]$Value } else { '<null>' })
+    $ls = $LineSample; if ($ls -ne $null -and $ls.Length -gt 120) { $ls = $ls.Substring(0,120) }
+    Write-Log ("ParseStat: AP='{0}' R={1} Field={2} Val={3} File='{4}' Line='{5}'" -f $AP,$Radio,$Field,$valTxt,$Path,$ls)
+  } catch {}
+}
+function Write-RateNote {
+  param([string]$AP,[string]$Radio,[string]$Label,[Nullable[double]]$After,[Nullable[double]]$Before,[int]$Dur,[Nullable[double]]$Rate)
+  try {
+    $aTxt = $(if ($After  -ne $null) { [string]$After  } else { '<null>' })
+    $bTxt = $(if ($Before -ne $null) { [string]$Before } else { '<null>' })
+    $rTxt = $(if ($Rate   -ne $null) { [string]$Rate   } else { '<null>' })
+    Write-Log ("RateNote: {0} AP='{1}' R={2} before={3} after={4} dur={5}s rate={6}" -f $Label,$AP,$Radio,$bTxt,$aTxt,$Dur,$rTxt)
+  } catch {}
 }
 function Init-Log { param([string]$Preferred,[string]$OutputHtmlPath,[string]$OutputCsvPath)
   if (-not [string]::IsNullOrWhiteSpace($Preferred)) {
@@ -536,10 +556,15 @@ function Parse-RadioStatsFile {
     }
 
     if ($line -match '(?i)\bRx\s*retry\s*frames?\b')  { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxRetry=[double]$n } }
+        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxRetry' -Value $obj.RxRetry -Path $Path -LineSample $line
     if ($line -match '(?i)\bRx\s*CRC\s*Errors?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxCRC  =[double]$n } }
+        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxCRC' -Value $obj.RxCRC -Path $Path -LineSample $line
     if ($line -match '(?i)\bRX\s*PLCP\s*Errors?\b')   { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxPLCP =[double]$n } }
+        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxPLCP' -Value $obj.RxPLCP -Path $Path -LineSample $line
     if ($line -match '(?i)\bChannel\s*Changes?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.ChannelChanges=[double]$n } }
+        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'ChannelChanges' -Value $obj.ChannelChanges -Path $Path -LineSample $line
     if ($line -match '(?i)\bTX\s*Power\s*Changes?\b') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxPowerChanges=[double]$n } }
+        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'TxPowerChanges' -Value $obj.TxPowerChanges -Path $Path -LineSample $line
 
     if ($line -match '(?i)\bChannel\s*busy\b') {
       $b1=$null; $b4=$null; $b64=$null
@@ -634,8 +659,13 @@ function Fix-Duration {
 
 # ===== 安全なレート算出 =====
 function SafeRate {
+  Write-Log ("SafeRate: enter")
+
   param([Nullable[double]]$After,[Nullable[double]]$Before,[int]$Dur,[string]$Label,[string]$AP,[string]$Radio)
-  if ($After -eq $null -or $Before -eq $null) { return $null }
+  if ($After -eq $null -or $Before -eq $null) { 
+    Write-Log ("SafeRate: drop due to nulls (After={0}, Before={1})" -f ($After -ne $null), ($Before -ne $null))
+    return $null 
+  }
   if ($Dur -le 0) { return $null }
   $diff = $After - $Before
   if ($diff -lt 0) { $diff = 0.0 }
@@ -853,9 +883,7 @@ foreach ($seg in $segments) {
   $before=$seg.Before.Data; $after=$seg.After.Data; $dur=$seg.DurationSec
 
   $startDisp=$seg.StartJst
-  if ($startDisp -eq $null -and $seg.Before -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.Before.Path)) { $startDisp=Get-FileTimeJst -p $seg.Before.Path -ctx "start" }
   $endDisp=$seg.EndJst
-  if ($endDisp -eq $null -and $seg.After -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.After.Path)) { $endDisp=Get-FileTimeJst -p $seg.After.Path -ctx "end" }
 
   $keys=New-Object System.Collections.Generic.HashSet[string]
   foreach ($k in $before.Keys) { [void]$keys.Add($k) }
@@ -868,7 +896,8 @@ foreach ($seg in $segments) {
 
     $ap='';$radio=''
     if ($a -ne $null) { $ap=$a.AP; $radio=$a.Radio }
-    if ([string]::IsNullOrWhiteSpace($ap) -and $b -ne $null) { $ap=$b.AP }
+    if ([string]::IsNullOrWhiteSpace($ap) -and $b -ne $null) { $ap=$b.AP
+    Write-Log ("RowKeys: AP='{0}' R={1} hasBefore={2} hasAfter={3}" -f $ap,$radio, ($before.ContainsKey($k)), ($after.ContainsKey($k))) }
     if ([string]::IsNullOrWhiteSpace($radio) -and $b -ne $null) { $radio=$b.Radio }
 
     $retry_ps = SafeRate -After $a.RxRetry -Before $b.RxRetry -Dur $dur -Label "RxRetry" -AP $ap -Radio $radio
@@ -878,6 +907,12 @@ foreach ($seg in $segments) {
     $txp_s    = SafeRate -After $a.TxPowerChanges -Before $b.TxPowerChanges -Dur $dur -Label "TxPowerChanges" -AP $ap -Radio $radio
     $chg_ph=$null; if ($chg_s -ne $null){ $chg_ph=[Math]::Round($chg_s*3600,6) }
     $txp_ph=$null; if ($txp_s -ne $null){ $txp_ph=[Math]::Round($txp_s*3600,6) }
+    Write-RateNote -AP $ap -Radio $radio -Label 'RxRetry/s' -After $a.RxRetry -Before $b.RxRetry -Dur $dur -Rate $retry_ps
+    Write-RateNote -AP $ap -Radio $radio -Label 'RxCRC/s'   -After $a.RxCRC   -Before $b.RxCRC   -Dur $dur -Rate $crc_ps
+    Write-RateNote -AP $ap -Radio $radio -Label 'RxPLCP/s'  -After $a.RxPLCP  -Before $b.RxPLCP  -Dur $dur -Rate $plcp_ps
+    Write-RateNote -AP $ap -Radio $radio -Label 'Chg/h'     -After $a.ChannelChanges -Before $b.ChannelChanges -Dur $dur -Rate $chg_ph
+    Write-RateNote -AP $ap -Radio $radio -Label 'TxP/h'     -After $a.TxPowerChanges -Before $b.TxPowerChanges -Dur $dur -Rate $txp_ph
+
 
     function Pick-AfterFirst { param($afterV,$beforeV) if ($afterV -ne $null) { return $afterV } return $beforeV }
     $busy1s = Pick-AfterFirst $a.Busy1s $b.Busy1s
