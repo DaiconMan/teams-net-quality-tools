@@ -1,14 +1,3 @@
-[CmdletBinding()]
-param(
-  [string]$BeforeFile,
-  [string]$AfterFile,
-  [int]$DurationSec,
-  [string[]]$SnapshotFiles,
-  [string]$OutputCsv,
-  [string]$OutputHtml,
-  [string]$Title,
-  [string]$LogFile
-)
 <# 
 .SYNOPSIS
   Aruba "show ap debug radio-stats" スナップショットの差分/秒を算出し、CSV/HTML を生成（JST表示）。
@@ -20,6 +9,18 @@ param(
   - LAA/NR-U 候補検出、時間帯コメント
   - PowerShell 5.1対応・三項演算子不使用・OneDrive/日本語/スペース対応・呼び出し演算子(&)不使用
 #>
+[CmdletBinding()]
+param(
+  [string]$BeforeFile,
+  [string]$AfterFile,
+  [int]$DurationSec,
+  [string[]]$SnapshotFiles,
+  [string]$OutputCsv,
+  [string]$OutputHtml,
+  [string]$Title,
+  [string]$LogFile
+)
+
 
 # ===== しきい値 =====
 $TH_BusyHigh   = 60
