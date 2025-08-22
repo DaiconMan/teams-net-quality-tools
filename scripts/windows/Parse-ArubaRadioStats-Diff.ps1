@@ -184,8 +184,8 @@ function TryExtractPercentTriplet {
   param([string]$Line,[ref]$Busy1s,[ref]$Busy4s,[ref]$Busy64s)
   $ok=$false
   $m1=[regex]::Match($Line,'\b1s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m1.Success){ $Busy1s.Value=[double]$m1.Groups[1].Value; $ok=$true }
-  $m4=[regex]::Match($Line,'\b4s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m4.Success){ $Busy4s.Value=[double]$m4.Groups[2].Value; $ok=$true }
-  $m64=[regex]::Match($Line,'\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $Busy64s.Value=[double]$m64.Groups[3].Value; $ok=$true }
+  $m4=[regex]::Match($Line,'\b4s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m4.Success){ $Busy4s.Value=[double]$m4.Groups[1].Value; $ok=$true }
+  $m64=[regex]::Match($Line,'\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $Busy64s.Value=[double]$m64.Groups[1].Value; $ok=$true }
   if ($ok) { return $true }
   $m=[regex]::Match($Line,'1s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}4s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}64s[^0-9]{0,5}(\d+(?:\.\d+)?)')
   if ($m.Success) { $Busy1s.Value=[double]$m.Groups[1].Value; $Busy4s.Value=[double]$m.Groups[2].Value; $Busy64s.Value=[double]$m.Groups[3].Value; return $true }
@@ -579,7 +579,7 @@ function Parse-RadioStatsFile {
     # 未確定の間は統計を読まない
     if ([string]::IsNullOrWhiteSpace($currentRadio)) { continue }
 
-    $obj = & $ensure $currentRadio
+    $obj = Ensure-RadioSlot $currentRadio
 
     # --- Channel（本文直接）: Channel Changes を除外
     if ($line -notmatch '(?i)Channel\s+Changes') {
@@ -635,7 +635,7 @@ function Parse-RadioStatsFile {
   if (-not $seenAnyRadio) {
     $leaf=$null; try{ $leaf=Split-Path -Path $Path -Leaf }catch{}
     $guess=$null; if ($leaf -and ($leaf -match '\b([012])\b')) { $guess=$Matches[1] } else { $guess='0' }
-    [void] & $ensure $guess
+    [void](Ensure-RadioSlot $guess)
     Write-Log ("Parse-RadioStatsFile: no radio markers; created empty slot radio={0}" -f $guess)
   }
 
@@ -845,7 +845,7 @@ function Make-Diagnosis {
   $labels=@('co','inter','qual','busy')
   $scores=@($scoreCoch,$scoreInter,$scoreQual,$scoreBusy)
   $power =@($pCoch,$pInter,$pQual,$pBusy)
-  $maxIdx=0; for($i=1;$i -lt $scores.Length;$i++){ if($scores[$i] -gt $scores[$maxIdx] -or ($scores[$i] -eq $scores[$maxIdx] -and $power[$i] -gt $power[$i])){ $maxIdx=$i } }
+  $maxIdx=0; for($i=1;$i -lt $scores.Length;$i++){ if($scores[$i] -gt $scores[$maxIdx] -or ($scores[$i] -eq $scores[$maxIdx] -and $power[$i] -gt $power[$maxIdx])){ $maxIdx=$i } }
   $root=$labels[$maxIdx]
 
   $simple='';$why='';$tips='';$sev='sev-ok'
