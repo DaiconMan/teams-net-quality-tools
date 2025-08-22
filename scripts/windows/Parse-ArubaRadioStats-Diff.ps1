@@ -19,7 +19,7 @@
 .PARAMETER DurationSec
   経過秒を明示的に上書きしたい場合のみ指定（通常は省略）。
 .PARAMETER OutputCsv
-  出力CSVのパス。未指定時は AfterFile と同一フォルダに自動命名。
+  出力CSVのパス。未指定時は AfterFile と同一フォルダ（不可ならカレント）に自動命名。
 .PARAMETER OutputHtml
   出力HTMLのパス。指定時は CSV に加えて HTML も生成。未指定時は作成しない。
 .PARAMETER Title
@@ -35,6 +35,24 @@ param(
   [string]$OutputHtml,
   [string]$Title
 )
+
+#--- 安全な親ディレクトリ取得（Split-Pathの引数が空/無効でも落ちない）
+function Get-ParentOrCwd {
+  param([string]$PathLike)
+  $dir = $null
+  if (-not [string]::IsNullOrWhiteSpace($PathLike)) {
+    if (Test-Path -LiteralPath $PathLike) {
+      try { $dir = Split-Path -LiteralPath $PathLike -Parent } catch { $dir = $null }
+    } else {
+      # ファイルが未作成でも、パスにディレクトリ部分が含まれていれば拾う
+      try { $dir = Split-Path -Path $PathLike -Parent } catch { $dir = $null }
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($dir)) {
+    try { return (Get-Location).Path } catch { return "." }
+  }
+  return $dir
+}
 
 #--- 文字列HTMLエスケープ（System.Web未依存）
 function HtmlEscape {
@@ -247,9 +265,9 @@ if ($DurationSec -le 0) {
   $DurationSec = $sec
 }
 
-# 出力先
+# 出力先（CSV）
 if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
-  $outDir = Split-Path -LiteralPath $AfterFile -Parent
+  $outDir = Get-ParentOrCwd -PathLike $AfterFile
   $ts = Get-Date -Format "yyyyMMdd_HHmmss"
   $OutputCsv = Join-Path -LiteralPath $outDir -ChildPath ("aruba_radio_stats_diff_{0}.csv" -f $ts)
 }
@@ -345,7 +363,8 @@ foreach ($k in $keys) {
 
 # ---- HTML 出力（任意） ----
 if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
-  $outDir = Split-Path -LiteralPath $OutputHtml -Parent
+  $outDir = Get-ParentOrCwd -PathLike $OutputHtml
+  # Join-Pathはファイル名と同名ディレクトリ防止のため、ここでは outDir をそのまま使用
   if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
   $titleText = $Title
@@ -356,7 +375,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
     $titleText = "Aruba Radio Stats Diff ($bt → $at)"
   }
 
-  # テーブルHTML組立
+  # テーブルHTML組立（省略せず全出力）
   $sb = New-Object System.Text.StringBuilder
   [void]$sb.AppendLine('<!DOCTYPE html>')
   [void]$sb.AppendLine('<meta charset="UTF-8">')
@@ -385,7 +404,6 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   [void]$sb.AppendLine('<div class="small"><span class="kpi">Busy = 空中占有（%）</span><span class="kpi">Retry/CRC/PLCP = 受信品質の悪化指標（/s）</span><span class="kpi">Channel/TX Power Changes = ARMの変更頻度（/h）</span></div>')
   [void]$sb.AppendLine('<div style="margin:10px 0"><input id="flt" type="search" placeholder="フィルタ（AP/数値を部分一致で抽出）..." oninput="filterTable()"></div>')
 
-  # テーブルヘッダ
   $cols = @(
     'AP','Radio','DurationSec',
     'RxRetry_per_s','RxCRC_per_s','RxPLCP_per_s',
@@ -396,9 +414,7 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   )
 
   [void]$sb.AppendLine('<table id="tbl"><thead><tr>')
-  foreach ($c in $cols) {
-    [void]$sb.AppendLine("<th data-col=""$c"">$c</th>")
-  }
+  foreach ($c in $cols) { [void]$sb.AppendLine("<th data-col=""$c"">$c</th>") }
   [void]$sb.AppendLine('</tr></thead><tbody>')
 
   foreach ($r in $rows) {
@@ -422,7 +438,6 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   [void]$sb.AppendLine('</tbody></table>')
   [void]$sb.AppendLine('<div class="note">ヘッダーをクリックでソート。検索ボックスで部分一致フィルタ（複数列対象）。</div>')
 
-  # ソート＆フィルタ JS（三項演算子不使用）
   [void]$sb.AppendLine('<script>
 (function(){
   var lastCol=-1, asc=true;
@@ -477,9 +492,18 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
 </script>')
 
   $html = $sb.ToString()
-  Set-Content -LiteralPath $OutputHtml -Value $html -Encoding UTF8
+
+  # OutputHtml がファイルパスの場合に備え、実ファイルパスを構成
+  $htmlPath = $OutputHtml
+  $htmlDir  = Get-ParentOrCwd -PathLike $OutputHtml
+  $nameOnly = $null
+  try { $nameOnly = Split-Path -Path $OutputHtml -Leaf } catch { $nameOnly = $null }
+  if ([string]::IsNullOrWhiteSpace($nameOnly)) { $nameOnly = "radio_stats_diff.html" }
+  $htmlPath = Join-Path -LiteralPath $htmlDir -ChildPath $nameOnly
+
+  Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
+  Write-Output ("HTML: {0}" -f $htmlPath)
 }
 
 Write-Output ("CSV : {0}" -f $OutputCsv)
-if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) { Write-Output ("HTML: {0}" -f $OutputHtml) }
 exit 0
