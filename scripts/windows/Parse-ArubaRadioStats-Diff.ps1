@@ -1,3 +1,29 @@
+
+# ---- Helper: Ensure-RadioSlot (top-level) ----
+function Ensure-RadioSlot {
+  param(
+    [hashtable]$Data,
+    [string]$ApName,
+    [string]$Radio
+  )
+  if ($null -eq $Data) { $Data = @{} }
+  $rk = ($ApName + '|' + $Radio)
+  if (-not $Data.ContainsKey($rk)) {
+    $Data[$rk] = New-Object psobject -Property @{
+      AP=$ApName; Radio=$Radio; Channel=$null;
+      RxRetry=$null; RxCRC=$null; RxPLCP=$null;
+      ChannelChanges=$null; TxPowerChanges=$null;
+      Busy1s=$null; Busy4s=$null; Busy64s=$null;
+      BusyBeacon=$null; TxBeacon=$null; RxBeacon=$null;
+      CCA_Our=$null; CCA_Other=$null; CCA_Interference=$null
+    }
+    Write-Log ("Parse-RadioStatsFile: init slot AP='{0}' Radio='{1}'" -f $ApName,$Radio)
+  } else {
+    if ([string]::IsNullOrWhiteSpace($Data[$rk].AP) -and -not [string]::IsNullOrWhiteSpace($ApName)) { $Data[$rk].AP=$ApName }
+  }
+  return $Data[$rk]
+}
+
 <# 
 .SYNOPSIS
   Aruba "show ap debug radio-stats" スナップショットの差分/秒を算出し、CSV/HTML を生成（JST表示）。
