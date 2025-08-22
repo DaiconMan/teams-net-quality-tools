@@ -1,4 +1,3 @@
-
 <# 
 .SYNOPSIS
   Aruba "show ap debug radio-stats" スナップショットの差分/秒を算出し、CSV/HTML を生成（JST表示）。
@@ -637,7 +636,7 @@ foreach ($seg in $segments) {
       if ($ccaI  -ne $null){ $h.CCAI   += $ccaI }
       if ($plcp_ps -ne $null){ $h.PLCP += $plcp_ps }
       if ($crc_ps  -ne $null){ $h.CRC  += $crc_ps }
-      if ($retry_ps- ne $null){ $h.Retry+= $retry_ps }
+      if ($retry_ps -ne $null){ $h.Retry += $retry_ps }  # ★修正："- ne" → "-ne"
     }
   }
 }
