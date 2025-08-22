@@ -580,7 +580,7 @@ function Parse-RadioStatsFile {
   }
 
   Write-Log ("Parse-RadioStatsFile: Path='{0}' OutputTimeUTC={1}" -f $Path, (ToLogStr-DT $otUtc "utc"))
-  return New-Object psobject -Property @{ Path=$Path; OutputTime=$otUtc; Data=$data; IsRadio=$true }
+  return New-Object psobject -Property @{ Path=$Path; AP=$apName; OutputTime=$otUtc; Data=$data; IsRadio=$true }
 }
 
 # ===== -SnapshotFiles 展開（非再帰） =====
