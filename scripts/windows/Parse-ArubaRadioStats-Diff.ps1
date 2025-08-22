@@ -579,7 +579,7 @@ function Parse-RadioStatsFile {
     # 未確定の間は統計を読まない
     if ([string]::IsNullOrWhiteSpace($currentRadio)) { continue }
 
-    $obj = Ensure-RadioSlot $currentRadio
+    $obj = (Ensure-RadioSlot -Data $data -ApName $apName -Radio $currentRadio)
 
     # --- Channel（本文直接）: Channel Changes を除外
     if ($line -notmatch '(?i)Channel\s+Changes') {
@@ -635,7 +635,7 @@ function Parse-RadioStatsFile {
   if (-not $seenAnyRadio) {
     $leaf=$null; try{ $leaf=Split-Path -Path $Path -Leaf }catch{}
     $guess=$null; if ($leaf -and ($leaf -match '\b([012])\b')) { $guess=$Matches[1] } else { $guess='0' }
-    [void](Ensure-RadioSlot $guess)
+    [void](Ensure-RadioSlot -Data $data -ApName $apName -Radio $guess)
     Write-Log ("Parse-RadioStatsFile: no radio markers; created empty slot radio={0}" -f $guess)
   }
 
