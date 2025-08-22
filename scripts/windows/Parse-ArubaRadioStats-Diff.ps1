@@ -508,41 +508,79 @@ function Ensure-RadioSlot {
 }
 
 # ===== radio-stats パーサ（AP名はフォルダ） =====
+
 function Parse-RadioStatsFile {
   param([string]$Path)
 
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ $lines=@() }
   if (-not (Is-RadioStatsLines -Lines $lines)) {
     Write-Log ("Parse-RadioStatsFile: not radio-stats '{0}'" -f $Path)
-    return New-Object psobject -Property @{ Path=$Path; OutputTime=$null; Data=@{}; IsRadio=$false }
+    return @()
   }
 
-  $otUtc   = Extract-OutputTime -Lines $lines -Path $Path
-
-  # ★AP名は親フォルダ名を最優先採用
+  # AP は親フォルダ名
   $apName  = Get-APName-From-Folder -Path $Path
   if ([string]::IsNullOrWhiteSpace($apName)) {
-    # フォールバック：ファイル名からのクレンジング（最終手段）
     try { $apName = Clean-APLeaf -leaf (Split-Path -Path $Path -Leaf) -context "filename" } catch { $apName = '' }
   }
   if ([string]::IsNullOrWhiteSpace($apName)) { $apName = 'Unknown' }
-  Write-Log ("AP Resolve: AP='{0}' (from folder/filename), file='{1}'" -f $apName,$Path)
 
-  $data=@{}; $currentRadio=$null; $seenAnyRadio=$false
+  $records = New-Object System.Collections.Generic.List[object]
+
+  $currentRadio = $null
+  $blockObj = $null
+  $lastOutUtc = $null
+
+  function New-EmptyBlock {
+    param([string]$ap,[string]$radio,[Nullable[DateTime]]$ot,[string]$path)
+    $data=@{}
+    $rk = ($ap + '|' + $radio)
+    $slot = New-Object psobject -Property @{
+      AP=$ap; Radio=$radio; Channel=$null;
+      RxRetry=$null; RxCRC=$null; RxPLCP=$null;
+      ChannelChanges=$null; TxPowerChanges=$null;
+      Busy1s=$null; Busy4s=$null; Busy64s=$null;
+      BusyBeacon=$null; TxBeacon=$null; RxBeacon=$null;
+      CCA_Our=$null; CCA_Other=$null; CCA_Interference=$null
+    }
+    $data[$rk] = $slot
+    $obj = New-Object psobject -Property @{
+      Path=$path; AP=$ap; Radio=$radio; OutputTime=$ot; Data=$data; IsRadio=$true
+    }
+    return $obj
+  }
 
   foreach ($raw in $lines) {
-    $line=($raw -replace '\r','').Trim(); if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $line=($raw -replace '\r','').Trim()
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
+    # Output Time があれば直近に保持
+    if ($line -match '(?i)Output\s*Time\s*[:=]\s*(.+)$') {
+      $tmp = Extract-OutputTime -Lines @($line) -Path $Path
+      if ($tmp -ne $null) { $lastOutUtc = $tmp; Write-Log ("Block: remember OutputTime {0}" -f (ToLogStr-DT $lastOutUtc "utc")) }
+    }
+
+    # ラジオブロック開始の検出
     $switched = $false
     if ($line -match '(?i)show\s+ap\s+debug\s+radio-stats\s+([012])\b') { $currentRadio=$Matches[1]; $switched=$true }
     elseif ($line -match '(?i)^\s*radio\s*([012])\b')                  { $currentRadio=$Matches[1]; $switched=$true }
     elseif ($line -match '(?i)\binterface\s*[:=]\s*wifi([01])\b')      { $currentRadio=$Matches[1]; $switched=$true }
     elseif ($line -match '(?i)\bRadio\s*([012])\b')                     { $currentRadio=$Matches[1]; $switched=$true }
-    if ($switched) { $seenAnyRadio = $true; Write-Log ("Parse-RadioStatsFile: switch -> Radio {0}" -f $currentRadio) }
 
-    if ([string]::IsNullOrWhiteSpace($currentRadio)) { continue }
+    if ($switched) {
+      if ($blockObj -ne $null) {
+        $records.Add($blockObj)
+        Write-Log ("Block: finalize AP='{0}' R={1} OT={2} file='{3}'" -f $blockObj.AP,$blockObj.Radio,(ToLogStr-DT $blockObj.OutputTime "utc"),$Path)
+      }
+      $blockObj = New-EmptyBlock -ap $apName -radio $currentRadio -ot $lastOutUtc -path $Path
+      Write-Log ("Block: start AP='{0}' R={1} OT={2} file='{3}'" -f $apName,$currentRadio,(ToLogStr-DT $lastOutUtc "utc"),$Path)
+      continue
+    }
 
-    $obj = (Ensure-RadioSlot -Data $data -ApName $apName -Radio $currentRadio)
+    if ($blockObj -eq $null) { continue } # ラジオ未確定ならスキップ
+
+    $rk = ($apName + '|' + $blockObj.Radio)
+    $obj = $blockObj.Data[$rk]
 
     if ($line -notmatch '(?i)Channel\s+Changes') {
       $mCh1=[regex]::Match($line,'(?i)\bCurrent\s*Channel\s*[:=]\s*(\d{1,3})\b')
@@ -551,20 +589,15 @@ function Parse-RadioStatsFile {
         $val = $null
         if ($mCh1.Success) { try { $val=[int]$mCh1.Groups[1].Value } catch {} }
         if ($val -eq $null -and $mCh2.Success) { try { $val=[int]$mCh2.Groups[1].Value } catch {} }
-        if ($val -ne $null) { $obj.Channel=$val; Write-Log ("Parse-RadioStatsFile: Channel from body AP='{0}' Radio='{1}' Ch={2}" -f $apName,$currentRadio,$val) }
+        if ($val -ne $null) { $obj.Channel=$val; Write-Log ("Parse-RadioStatsFile: Channel from body AP='{0}' Radio='{1}' Ch={2}" -f $apName,$blockObj.Radio,$val) }
       }
     }
 
-    if ($line -match '(?i)\bRx\s*retry\s*frames?\b')  { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxRetry=[double]$n } }
-        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxRetry' -Value $obj.RxRetry -Path $Path -LineSample $line
-    if ($line -match '(?i)\bRx\s*CRC\s*Errors?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxCRC  =[double]$n } }
-        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxCRC' -Value $obj.RxCRC -Path $Path -LineSample $line
-    if ($line -match '(?i)\bRX\s*PLCP\s*Errors?\b')   { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxPLCP =[double]$n } }
-        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'RxPLCP' -Value $obj.RxPLCP -Path $Path -LineSample $line
-    if ($line -match '(?i)\bChannel\s*Changes?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.ChannelChanges=[double]$n } }
-        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'ChannelChanges' -Value $obj.ChannelChanges -Path $Path -LineSample $line
-    if ($line -match '(?i)\bTX\s*Power\s*Changes?\b') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxPowerChanges=[double]$n } }
-        Write-ParseStat -AP $apName -Radio $currentRadio -Field 'TxPowerChanges' -Value $obj.TxPowerChanges -Path $Path -LineSample $line
+    if ($line -match '(?i)\bRx\s*retry\s*frames?\b')  { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxRetry=[double]$n; Write-ParseStat -AP $apName -Radio $blockObj.Radio -Field 'RxRetry' -Value $obj.RxRetry -Path $Path -LineSample $line } }
+    if ($line -match '(?i)\bRx\s*CRC\s*Errors?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxCRC  =[double]$n; Write-ParseStat -AP $apName -Radio $blockObj.Radio -Field 'RxCRC' -Value $obj.RxCRC -Path $Path -LineSample $line } }
+    if ($line -match '(?i)\bRX\s*PLCP\s*Errors?\b')   { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxPLCP =[double]$n; Write-ParseStat -AP $apName -Radio $blockObj.Radio -Field 'RxPLCP' -Value $obj.RxPLCP -Path $Path -LineSample $line } }
+    if ($line -match '(?i)\bChannel\s*Changes?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.ChannelChanges=[double]$n; Write-ParseStat -AP $apName -Radio $blockObj.Radio -Field 'ChannelChanges' -Value $obj.ChannelChanges -Path $Path -LineSample $line } }
+    if ($line -match '(?i)\bTX\s*Power\s*Changes?\b') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxPowerChanges=[double]$n; Write-ParseStat -AP $apName -Radio $blockObj.Radio -Field 'TxPowerChanges' -Value $obj.TxPowerChanges -Path $Path -LineSample $line } }
 
     if ($line -match '(?i)\bChannel\s*busy\b') {
       $b1=$null; $b4=$null; $b64=$null
@@ -598,15 +631,20 @@ function Parse-RadioStatsFile {
     }
   }
 
-  if (-not $seenAnyRadio) {
-    $guess='0'
-    [void](Ensure-RadioSlot -Data $data -ApName $apName -Radio $guess)
-    Write-Log ("Parse-RadioStatsFile: no radio markers; created empty slot radio={0}" -f $guess)
+  if ($blockObj -ne $null) {
+    $records.Add($blockObj)
+    Write-Log ("Block: finalize AP='{0}' R={1} OT={2} file='{3}'" -f $blockObj.AP,$blockObj.Radio,(ToLogStr-DT $blockObj.OutputTime "utc"),$Path)
   }
 
-  Write-Log ("Parse-RadioStatsFile: Path='{0}' OutputTimeUTC={1}" -f $Path, (ToLogStr-DT $otUtc "utc"))
-  return New-Object psobject -Property @{ Path=$Path; AP=$apName; OutputTime=$otUtc; Data=$data; IsRadio=$true }
+  # ブロックが1つも検出できなかった場合、従来互換で「ファイル全体を単一ブロック」として返す（Radio未確定は0）
+  if ($records.Count -eq 0) {
+    $fallback = New-Object psobject -Property @{ Path=$Path; AP=$apName; Radio='0'; OutputTime=$lastOutUtc; Data=@{}; IsRadio=$true }
+    $records.Add($fallback)
+  }
+
+  return ,$records
 }
+
 
 # ===== -SnapshotFiles 展開（非再帰） =====
 function Expand-SnapshotInputs { param([string[]]$Inputs)
