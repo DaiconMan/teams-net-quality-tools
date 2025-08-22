@@ -6,7 +6,14 @@
   - -SnapshotFiles はフォルダ/ワイルドカード/ファイル混在OK（展開後2ファイル以上）
   - radio-stats 以外（arm history 等）はスナップショットとしては除外（補完専用）
   - LAA/NR-U 候補検出、時間帯コメント
-  - PowerShell 5.1対応・三項演算子不使用・Host未使用・日本語/スペース/OneDrive対応
+  - PowerShell 5.1対応・三項演算子不使用・予約語 Host 未使用・OneDrive/日本語/スペース対応
+
+  ★ ログ機能（本修正）
+    - -LogFile で明示指定可。未指定時は OutputHtml/OutputCsv のフォルダに自動命名で出力
+    - 出力内容:
+        * Output Time の生行 / マッチ種別 / 解析UTC / Kind
+        * Convert-ToJst 入出力、使用TZ、フォールバック分岐
+        * ファイル時刻(JST)フォールバック、セグメント長(秒)、入力ファイルパス
 #>
 
 [CmdletBinding()]
@@ -17,7 +24,8 @@ param(
   [string[]]$SnapshotFiles,
   [string]$OutputCsv,
   [string]$OutputHtml,
-  [string]$Title
+  [string]$Title,
+  [string]$LogFile
 )
 
 # ===== しきい値 =====
@@ -37,18 +45,70 @@ $TH_LAA_MinInterf = 12
 $TH_LAA_MaxOther  = 10
 $TH_LAA_MinBusy   = 35
 
+# ===== ログ =====
+$Script:LogPath = $null
+function Write-Log {
+  param([string]$Msg)
+  if ([string]::IsNullOrWhiteSpace($Script:LogPath)) { return }
+  $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffK"
+  $line = "[{0}] {1}" -f $ts, $Msg
+  try { Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8 } catch {}
+}
+function Init-Log {
+  param([string]$Preferred,[string]$OutputHtmlPath,[string]$OutputCsvPath)
+  if (-not [string]::IsNullOrWhiteSpace($Preferred)) {
+    $Script:LogPath = $Preferred
+    try {
+      $dir = Split-Path -Path $Script:LogPath -Parent
+      if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+      Set-Content -LiteralPath $Script:LogPath -Value "# Aruba Radio Stats Diff Log (UTF-8)" -Encoding UTF8
+    } catch {}
+    return
+  }
+  $baseDir = $null
+  if (-not [string]::IsNullOrWhiteSpace($OutputHtmlPath)) {
+    try { $baseDir = Split-Path -Path $OutputHtmlPath -Parent } catch { $baseDir = $null }
+  }
+  if ([string]::IsNullOrWhiteSpace($baseDir) -and -not [string]::IsNullOrWhiteSpace($OutputCsvPath)) {
+    try { $baseDir = Split-Path -Path $OutputCsvPath -Parent } catch { $baseDir = $null }
+  }
+  if ([string]::IsNullOrWhiteSpace($baseDir)) {
+    try { $baseDir = (Get-Location).Path } catch { $baseDir = "." }
+  }
+  if (-not (Test-Path -LiteralPath $baseDir)) {
+    try { New-Item -ItemType Directory -Path $baseDir -Force | Out-Null } catch {}
+  }
+  $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+  $Script:LogPath = Join-Path -Path $baseDir -ChildPath ("aruba_radio_stats_diff_LOG_{0}.txt" -f $ts)
+  try { Set-Content -LiteralPath $Script:LogPath -Value "# Aruba Radio Stats Diff Log (UTF-8)" -Encoding UTF8 } catch {}
+}
+
+function ToLogStr-DT {
+  param([Nullable[DateTime]]$dt,[string]$Label)
+  if ($dt -eq $null) { return ("{0}=<null>" -f $Label) }
+  $v = $dt.Value
+  $kind = $v.Kind.ToString()
+  $iso  = $v.ToString("yyyy-MM-dd HH:mm:ss 'Kind='") + $kind
+  return ("{0}={1}" -f $Label, $iso)
+}
+
 # ===== JST 変換 =====
 function Convert-ToJst {
-  param([Nullable[DateTime]]$dt)
-  if ($dt -eq $null) { return $null }
+  param([Nullable[DateTime]]$dt,[string]$Context)
+  if ($dt -eq $null) { Write-Log ("Convert-ToJst: {0} input=<null>" -f $Context); return $null }
   $tz = $null
-  try { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Tokyo Standard Time") } catch { $tz = $null }
+  try { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Tokyo Standard Time"); Write-Log ("Convert-ToJst: TZ='Tokyo Standard Time' found") } catch { Write-Log ("Convert-ToJst: TZ lookup failed, will +9h fallback") ; $tz = $null }
   try {
     $v = $dt.Value
-    if     ($v.Kind -eq [System.DateTimeKind]::Unspecified) { $v = [DateTime]::SpecifyKind($v, [System.DateTimeKind]::Utc) }
-    elseif ($v.Kind -eq [System.DateTimeKind]::Local)       { $v = [System.TimeZoneInfo]::ConvertTimeToUtc($v) }
-    if ($tz -ne $null) { return [System.TimeZoneInfo]::ConvertTimeFromUtc($v, $tz) } else { return $v.AddHours(9) }
-  } catch { try { return $dt.Value.AddHours(9) } catch { return $dt } }
+    Write-Log ("Convert-ToJst: {0} IN {1}" -f $Context, (ToLogStr-DT $v "dt"))
+    if     ($v.Kind -eq [System.DateTimeKind]::Unspecified) { Write-Log "Convert-ToJst: Kind=Unspecified → Assume UTC"; $v = [DateTime]::SpecifyKind($v, [System.DateTimeKind]::Utc) }
+    elseif ($v.Kind -eq [System.DateTimeKind]::Local)       { Write-Log "Convert-ToJst: Kind=Local → ConvertTimeToUtc"; $v = [System.TimeZoneInfo]::ConvertTimeToUtc($v) }
+    if ($tz -ne $null) { $ret=[System.TimeZoneInfo]::ConvertTimeFromUtc($v, $tz); Write-Log ("Convert-ToJst: {0} OUT {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret }
+    else               { $ret=$v.AddHours(9); Write-Log ("Convert-ToJst: {0} OUT(+9h fallback) {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret }
+  } catch {
+    Write-Log ("Convert-ToJst: Exception → +9h fallback. " + $_.Exception.Message)
+    try { $ret=$dt.Value.AddHours(9); Write-Log ("Convert-ToJst: {0} OUT(+9h after err) {1}" -f $Context, (ToLogStr-DT $ret "jst")); return $ret } catch { return $dt }
+  }
 }
 
 # ===== 補助 =====
@@ -72,62 +132,59 @@ function Get-LastNumber { param([string]$Line)
   $m=[regex]::Matches($Line,'(-?\d+(?:\.\d+)?)'); if($m.Count -gt 0){ return [double]$m[$m.Count-1].Value } return $null
 }
 
-# Busy 1s/4s/64s の抽出を強化
+# Busy 1s/4s/64s
 function TryExtractPercentTriplet {
-  param(
-    [string]$Line,
-    [ref]$Busy1s,
-    [ref]$Busy4s,
-    [ref]$Busy64s
-  )
+  param([string]$Line,[ref]$Busy1s,[ref]$Busy4s,[ref]$Busy64s)
   $ok=$false
-  # 代表例: "Channel busy 1s: 64% 4s: 42% 64s: 42%"
   $m1=[regex]::Match($Line,'\b1s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m1.Success){ $Busy1s.Value=[double]$m1.Groups[1].Value; $ok=$true }
   $m4=[regex]::Match($Line,'\b4s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m4.Success){ $Busy4s.Value=[double]$m4.Groups[1].Value; $ok=$true }
   $m64=[regex]::Match($Line,'\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $Busy64s.Value=[double]$m64.Groups[1].Value; $ok=$true }
   if ($ok) { return $true }
-
-  # 代表例: "1s/4s/64s: 64/42/42" or "1s:64 4s:42 64s:42"
   $m=[regex]::Match($Line,'1s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}4s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}64s[^0-9]{0,5}(\d+(?:\.\d+)?)')
-  if ($m.Success) {
-    $Busy1s.Value=[double]$m.Groups[1].Value
-    $Busy4s.Value=[double]$m.Groups[2].Value
-    $Busy64s.Value=[double]$m.Groups[3].Value
-    return $true
-  }
+  if ($m.Success) { $Busy1s.Value=[double]$m.Groups[1].Value; $Busy4s.Value=[double]$m.Groups[2].Value; $Busy64s.Value=[double]$m.Groups[3].Value; return $true }
   return $false
 }
 
-# Output Time を UTC として取り出す
+# Output Time を UTC として取り出す（内部でログ）
 function Extract-OutputTime {
-  param([string[]]$Lines)
+  param([string[]]$Lines,[string]$Path)
   if ($Lines -eq $null -or $Lines.Count -eq 0) { return $null }
   foreach ($raw in $Lines) {
     $line = ($raw -replace '\r','').Trim()
     if ($line -match '(?i)Output\s*Time\s*[:=]\s*(.+)$') {
       $rhs = $Matches[1].Trim()
+      Write-Log ("OutputTime: Path='{0}' RawLine='{1}' Rhs='{2}'" -f $Path,$line,$rhs)
 
-      # 1) "2025-08-22 03:38:51 UTC"（コロン直後に日時が来てもOK）
+      # 1) "YYYY-MM-DD HH:mm:ss UTC"
       $mUtc=[regex]::Match($rhs,'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*(UTC|GMT)\b',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
       if($mUtc.Success){
         try{
           $dt=[DateTime]::Parse($mUtc.Groups[1].Value,[System.Globalization.CultureInfo]::InvariantCulture)
-          return [DateTime]::SpecifyKind($dt,[System.DateTimeKind]::Utc)
-        }catch{}
+          $ret=[DateTime]::SpecifyKind($dt,[System.DateTimeKind]::Utc)
+          Write-Log ("OutputTime: match=UTC-text parsed={0}" -f ((ToLogStr-DT $ret "utc")))
+          return $ret
+        }catch{ Write-Log ("OutputTime: parse err (UTC-text) " + $_.Exception.Message) }
       }
 
-      # 2) epoch 秒 / ミリ秒
-      if ($rhs -match '^\d{10}(\.\d+)?$') { try { $sec=[long]([double]$rhs); return ([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime } catch {} }
-      if ($rhs -match '^\d{13}$')        { try { $ms=[long]$rhs; return ([System.DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime } catch {} }
+      # 2) epoch 秒/ミリ秒
+      if ($rhs -match '^\d{10}(\.\d+)?$') {
+        try { $sec=[long]([double]$rhs); $ret=([System.DateTimeOffset]::FromUnixTimeSeconds($sec)).UtcDateTime; Write-Log ("OutputTime: match=epoch-seconds parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log "OutputTime: epoch-seconds parse err" }
+      }
+      if ($rhs -match '^\d{13}$') {
+        try { $ms=[long]$rhs; $ret=([System.DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime; Write-Log ("OutputTime: match=epoch-millis parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log "OutputTime: epoch-millis parse err" }
+      }
 
       # 3) ISO8601 with offset/Z
       $dto=[System.DateTimeOffset]::MinValue
-      if ([System.DateTimeOffset]::TryParse($rhs,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::AssumeUniversal,[ref]$dto)) { return $dto.UtcDateTime }
+      if ([System.DateTimeOffset]::TryParse($rhs,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::AssumeUniversal,[ref]$dto)) {
+        $ret=$dto.UtcDateTime; Write-Log ("OutputTime: match=iso8601 parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret
+      }
 
       # 4) 最後の手段：UTC と仮定
-      try { $dt2=[DateTime]::Parse($rhs,[System.Globalization.CultureInfo]::InvariantCulture); return [DateTime]::SpecifyKind($dt2,[System.DateTimeKind]::Utc) } catch {}
+      try { $dt2=[DateTime]::Parse($rhs,[System.Globalization.CultureInfo]::InvariantCulture); $ret=[DateTime]::SpecifyKind($dt2,[System.DateTimeKind]::Utc); Write-Log ("OutputTime: match=fallback parsed={0}" -f ((ToLogStr-DT $ret "utc"))); return $ret } catch { Write-Log ("OutputTime: all patterns failed") }
     }
   }
+  Write-Log ("OutputTime: not found in '{0}'" -f $Path)
   return $null
 }
 
@@ -145,7 +202,7 @@ function Is-RadioStatsLines { param([string[]]$Lines)
   return $false
 }
 
-# ===== AP名推定／補正 =====
+# ===== AP名推定/補正（省略：前版と同一） =====
 function Guess-APName { param([string[]]$Lines,[string]$Path)
   foreach ($raw in $Lines) {
     $line = ($raw -replace '\r','').Trim()
@@ -181,7 +238,7 @@ function Fix-AP-From-Backup { param([string]$ap,[string]$path,[hashtable]$Backup
   return $ap
 }
 
-# ===== バンド判定 =====
+# ===== バンド判定/バックアップ取り込み（省略：前版と同一） =====
 function Get-BandFromChannel { param([Nullable[int]]$Channel)
   if ($Channel -eq $null) { return '' }
   $ch=[int]$Channel
@@ -203,8 +260,6 @@ function Map-PhyType-To-Band { param([string]$s)
   if ($t -match '2\.4ghz' -or $t -match '\b2g\b' -or $t -match '\b11b\b' -or $t -match '\b11g\b') { return '2.4GHz' }
   return ''
 }
-
-# ===== バックアップ格納 =====
 function New-BackupSlot { return New-Object psobject -Property @{ Ch24=$null; T24=$null; Ch5=$null; T5=$null; Ch6=$null; T6=$null } }
 function Detect-Band-Token { param([string]$line,[Nullable[int]]$ch)
   $s=$line.ToLower()
@@ -222,8 +277,6 @@ function Update-Backup { param([hashtable]$Backup,[string]$ap,[string]$band,[Nul
   elseif ($band -eq '5GHz')   { if ($slot.T5  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T5 )) { $slot.Ch5 =[int]$ch; $slot.T5 =$ts } }
   elseif ($band -eq '6GHz')   { if ($slot.T6  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T6 )) { $slot.Ch6 =[int]$ch; $slot.T6 =$ts } }
 }
-
-# ===== バックアップ取り込み =====
 function Parse-BssTable-File { param([string]$Path,[hashtable]$Backup)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
   $lines=@(); try{ $lines=Get-Content -LiteralPath $Path -Encoding UTF8 }catch{ return }
@@ -298,7 +351,7 @@ function Parse-ARMHistory-File { param([string]$Path,[hashtable]$Backup)
     $line = ($raw -replace '\r','').Trim()
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $mPhy=[regex]::Match($line,'(?i)\bPhy[-\s]?Type\s*[:=]\s*([A-Za-z0-9\.]+)'); if($mPhy.Success){ $b = Map-PhyType-To-Band $mPhy.Groups[1].Value; if (-not [string]::IsNullOrWhiteSpace($b)) { $curBand = $b } }
-    if ($line -match '(?i)\binterface\s*[:=]\s*([A-Za-z0-9_\-\.]+)') { $null = $Matches[1] } # ブロック切替のみ
+    if ($line -match '(?i)\binterface\s*[:=]\s*([A-Za-z0-9_\-\.]+)') { $null = $Matches[1] }
     $ch=$null
     $mCh1=[regex]::Match($line,'(?i)\bChannel\s*[:=]\s*(\d{1,3})\b')
     if ($mCh1.Success) { try { $ch=[int]$mCh1.Groups[1].Value } catch {} }
@@ -357,8 +410,8 @@ function Parse-RadioStatsFile {
     return New-Object psobject -Property @{ Path=$Path; OutputTime=$null; Data=@{}; IsRadio=$false }
   }
 
-  $otUtc = Extract-OutputTime -Lines $lines
-  $apName = Guess-APName -Lines $lines -Path $Path
+  $otUtc   = Extract-OutputTime -Lines $lines -Path $Path
+  $apName  = Guess-APName -Lines $lines -Path $Path
 
   $data=@{}; $currentRadio=''
   $ensure = {
@@ -397,7 +450,6 @@ function Parse-RadioStatsFile {
     if ($line -match '(?i)\bTX\s*Power\s*Changes?\b') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxPowerChanges=[double]$n } }
 
     if ($line -match '(?i)\bChannel\s*busy\b') {
-      # ★ 修正：PSReference を正しく [ref] で渡す
       $b1=$null; $b4=$null; $b64=$null
       if (TryExtractPercentTriplet -Line $line -Busy1s ([ref]$b1) -Busy4s ([ref]$b4) -Busy64s ([ref]$b64)) {
         if ($b1 -ne $null){ $obj.Busy1s=[double]$b1 }
@@ -430,6 +482,7 @@ function Parse-RadioStatsFile {
     }
   }
 
+  Write-Log ("Parse-RadioStatsFile: Path='{0}' OutputTimeUTC={1}" -f $Path, (ToLogStr-DT $otUtc "utc"))
   return New-Object psobject -Property @{ Path=$Path; OutputTime=$otUtc; Data=$data; IsRadio=$true }
 }
 
@@ -462,29 +515,45 @@ function Expand-SnapshotInputs { param([string[]]$Inputs)
   return $out
 }
 
-# ===== 入力の読み込み =====
+# ===== ここから処理開始 =====
+Init-Log -Preferred $LogFile -OutputHtmlPath $OutputHtml -OutputCsvPath $OutputCsv
+Write-Log "=== START ==="
+Write-Log ("Args: Before='{0}' After='{1}' Snapshots='{2}' Html='{3}' Csv='{4}'" -f $BeforeFile,$AfterFile,($SnapshotFiles -join ';'),$OutputHtml,$OutputCsv)
+
 $segments=@()
 $allInputFiles=@()
 $radioParsed=@()
 
 if ($SnapshotFiles -and $SnapshotFiles.Count -ge 1) {
   $fileList = Expand-SnapshotInputs -Inputs $SnapshotFiles
+  Write-Log ("Expand-SnapshotInputs: {0} files" -f $fileList.Count)
   if ($fileList.Count -lt 2) { throw "SnapshotFiles: 指定から2つ以上のファイルが見つかりません。フォルダ直下に2つ以上置くか、複数ファイル/ワイルドカードを指定してください。" }
   $allInputFiles = $fileList
+
   foreach ($f in $fileList) {
     $lines=@(); try{ $lines=Get-Content -LiteralPath $f -Encoding UTF8 -TotalCount 60 }catch{ $lines=@() }
-    if (Is-RadioStatsLines -Lines $lines) { $radioParsed += (Parse-RadioStatsFile -Path $f) }
+    if (Is-RadioStatsLines -Lines $lines) {
+      Write-Log ("Pick radio-stats: {0}" -f $f)
+      $radioParsed += (Parse-RadioStatsFile -Path $f)
+    } else {
+      Write-Log ("Skip(non radio-stats): {0}" -f $f)
+    }
   }
   if ($radioParsed.Count -lt 2) { throw "radio-stats の候補が2つ未満でした。arm history / aps / bss-table / radio-info はスナップショット対象外です。radio-stats の出力ファイルを2つ以上配置してください。" }
+
   $sorted = $radioParsed | Sort-Object { if ($_.OutputTime -ne $null) { $_.OutputTime } else { [System.IO.File]::GetLastWriteTime($_.Path) } }
+
   for ($i=0; $i -lt $sorted.Count-1; $i++) {
     $b=$sorted[$i]; $a=$sorted[$i+1]
     $bt=$b.OutputTime; $at=$a.OutputTime
     $sec=0
     if ($bt -ne $null -and $at -ne $null) { try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 } }
-    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($b.Path); $t2=[System.IO.File]::GetLastWriteTime($a.Path); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) } catch { $sec=0 } }
-    if ($sec -le 0) { $sec=900 }
-    $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=(Convert-ToJst $bt); EndJst=(Convert-ToJst $at) })
+    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($b.Path); $t2=[System.IO.File]::GetLastWriteTime($a.Path); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) ; Write-Log ("Duration fallback by filetime sec={0} (b={1} a={2})" -f $sec,$t1,$t2)} catch { $sec=0 } }
+    if ($sec -le 0) { $sec=900; Write-Log "Duration fallback to default 900s" }
+    $sj = Convert-ToJst -dt $bt -Context ("seg{0}-startUtc" -f $i)
+    $ej = Convert-ToJst -dt $at -Context ("seg{0}-endUtc"   -f $i)
+    $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=$sj; EndJst=$ej })
+    Write-Log ("Segment[{0}] durSec={1} StartJST={2} EndJST={3}" -f $i,$sec,$sj,$ej)
   }
 }
 elseif (-not [string]::IsNullOrWhiteSpace($BeforeFile) -and -not [string]::IsNullOrWhiteSpace($AfterFile)) {
@@ -496,11 +565,14 @@ elseif (-not [string]::IsNullOrWhiteSpace($BeforeFile) -and -not [string]::IsNul
   if ($DurationSec -le 0) {
     $sec=0
     if ($bt -ne $null -and $at -ne $null) { try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 } }
-    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($BeforeFile); $t2=[System.IO.File]::GetLastWriteTime($AfterFile); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) } catch { $sec=0 } }
-    if ($sec -le 0) { $sec=900 }
+    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($BeforeFile); $t2=[System.IO.File]::GetLastWriteTime($AfterFile); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) ; Write-Log ("Duration fallback by filetime sec={0} (b={1} a={2})" -f $sec,$t1,$t2)} catch { $sec=0 } }
+    if ($sec -le 0) { $sec=900; Write-Log "Duration fallback to default 900s" }
     $DurationSec=$sec
   } else { $sec=$DurationSec }
-  $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=(Convert-ToJst $bt); EndJst=(Convert-ToJst $at) })
+  $sj = Convert-ToJst -dt $bt -Context "single-startUtc"
+  $ej = Convert-ToJst -dt $at -Context "single-endUtc"
+  $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=$sj; EndJst=$ej })
+  Write-Log ("Single durSec={0} StartJST={1} EndJST={2}" -f $sec,$sj,$ej)
 }
 else {
   throw "単区間比較は -BeforeFile/-AfterFile、時系列集計は -SnapshotFiles に（フォルダ/ワイルドカード/ファイルのいずれかを）1個以上指定してください（展開後2つ以上の radio-stats ファイルが必要）。"
@@ -515,6 +587,7 @@ foreach ($seg in $segments) {
   if (-not [string]::IsNullOrWhiteSpace($d2)) { [void]$dirs.Add($d2) }
 }
 $dirList=@(); foreach ($d in $dirs) { $dirList += $d }
+Write-Log ("Backup scan dirs: " + ($dirList -join ';'))
 $BackupMap = Build-Backup-From-Dirs -Dirs $dirList
 
 # ===== CSV 出力先 =====
@@ -524,6 +597,7 @@ if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
   $ts = Get-Date -Format "yyyyMMdd_HHmmss"
   $OutputCsv = Join-Path -Path $outDir -ChildPath ("aruba_radio_stats_diff_{0}.csv" -f $ts)
 }
+Write-Log ("OutputCsv: " + $OutputCsv)
 
 # ===== 列定義 =====
 $colDefs = @(
@@ -648,20 +722,27 @@ function Diff-NonNegative { param([double]$After,[double]$Before)
   return $d
 }
 
-# ===== 集計 =====
+# ===== 集計・HTML/CSV 出力 =====
 $rows=@()
 $cards=@()
 $hourBuckets=@{}
 
-function Get-FileTimeJst { param([string]$p) try { return Convert-ToJst ([System.IO.File]::GetLastWriteTime($p)) } catch { return $null } }
+function Get-FileTimeJst {
+  param([string]$p,[string]$ctx)
+  try {
+    $t=[System.IO.File]::GetLastWriteTime($p)
+    Write-Log ("FileTime: {0}={1}" -f $ctx,$t)
+    return (Convert-ToJst -dt $t -Context ("{0}-filetime" -f $ctx))
+  } catch { return $null }
+}
 
 foreach ($seg in $segments) {
   $before=$seg.Before.Data; $after=$seg.After.Data; $dur=$seg.DurationSec
 
   $startDisp=$seg.StartJst
-  if ($startDisp -eq $null -and $seg.Before -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.Before.Path)) { $startDisp=Get-FileTimeJst -p $seg.Before.Path }
+  if ($startDisp -eq $null -and $seg.Before -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.Before.Path)) { $startDisp=Get-FileTimeJst -p $seg.Before.Path -ctx "start" }
   $endDisp=$seg.EndJst
-  if ($endDisp -eq $null -and $seg.After -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.After.Path)) { $endDisp=Get-FileTimeJst -p $seg.After.Path }
+  if ($endDisp -eq $null -and $seg.After -ne $null -and -not [string]::IsNullOrWhiteSpace($seg.After.Path)) { $endDisp=Get-FileTimeJst -p $seg.After.Path -ctx "end" }
 
   $keys=New-Object System.Collections.Generic.HashSet[string]
   foreach ($k in $before.Keys) { [void]$keys.Add($k) }
@@ -753,7 +834,7 @@ foreach ($seg in $segments) {
       BusyBeacon_pct=$busyB; TxBeacon_pct=$txB; RxBeacon_pct=$rxB;
       CCA_Our_pct=$ccaO; CCA_Other_pct=$ccaOt; CCA_Interference_pct=$ccaI
     }
-    $vals=@(); foreach ($def in $colDefs) { $name=$def[0]; $v=$rowObj.PSObject.Properties[$name].Value; if ($v -eq $null) { $vals+='' } else { $vals+=$v.ToString() } }
+    $vals=@(); foreach ($def in $colDefs) { $name=$def[0]; $v=$rowObj.PSObject.Properties[$name].Value; if ($v -eq $null) { $vals+='' } else { $vals+=$v } }
     $escaped=@(); foreach($v in $vals){ if($v -match '[,"]'){ $escaped+=('"{0}"' -f ($v -replace '"','""')) } else { $escaped+=$v } }
     Add-Content -LiteralPath $OutputCsv -Value ($escaped -join ',') -Encoding UTF8
 
@@ -849,15 +930,15 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   [void]$sb.AppendLine('<div style="margin:10px 0"><input id="flt" type="search" placeholder="フィルタ（AP/数値/文言）..." oninput="filterTable()"></div>')
 
   [void]$sb.AppendLine('<details class="help"><summary>列の見方（クリックで開閉）</summary><div><ul>')
-  foreach ($pair in $cols) { [void]$sb.AppendLine('<li><b>'+ (HtmlEscape $pair[0]) +'</b>：'+ (HtmlEscape $pair[1]) +'</li>') }
+  foreach ($pair in $colDefs) { [void]$sb.AppendLine('<li><b>'+ (HtmlEscape $pair[0]) +'</b>：'+ (HtmlEscape $pair[1]) +'</li>') }
   [void]$sb.AppendLine('</ul></div></details>')
 
   [void]$sb.AppendLine('<table id="tbl"><thead><tr>')
-  foreach ($pair in $cols) { $name=$pair[0]; $desc=$pair[1]; [void]$sb.AppendLine('<th title="'+ (HtmlEscape $desc) +'">'+ (HtmlEscape $name) +'</th>') }
+  foreach ($pair in $colDefs) { $name=$pair[0]; $desc=$pair[1]; [void]$sb.AppendLine('<th title="'+ (HtmlEscape $desc) +'">'+ (HtmlEscape $name) +'</th>') }
   [void]$sb.AppendLine('</tr></thead><tbody>')
   foreach ($r in $rows) {
     [void]$sb.AppendLine('<tr>')
-    foreach ($pair in $cols) {
+    foreach ($pair in $colDefs) {
       $c=$pair[0]; $v=$r.PSObject.Properties[$c].Value
       $text=''; if ($null -ne $v) { if ($v -is [double] -or $v -is [single]) { $text=([string]([Math]::Round([double]$v,6))) } else { $text=[string]$v } }
       if ($c -eq 'StartJST' -or $c -eq 'EndJST') { if ($text -ne '') { $text = $text + ' JST' } }
@@ -885,5 +966,7 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
   $htmlPath=Join-Path -Path $outDir -ChildPath $nameOnly
   Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
   Write-Output ("HTML: {0}" -f $htmlPath)
+  Write-Log ("HTML written: {0}" -f $htmlPath)
 }
+Write-Log "=== END ==="
 exit 0
