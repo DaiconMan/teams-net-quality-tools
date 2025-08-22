@@ -8,11 +8,16 @@
   - LAA/NR-U 候補検出、時間帯コメント
   - PowerShell 5.1対応・三項演算子不使用・OneDrive/日本語/スペース対応
 
-  ★ 時刻パース強化（今回の修正）
+  ★ 時刻パース強化
     - "Output Time: 2025-08-22 03:38:51 UTC" のような RHS を厳密に分解
     - "JST" の場合はいったん UTC に換算（-9h）してから JST 表示へ
     - 小数秒(.fff...) や ISO8601(Z/±hh:mm/±hhmm) も対応
     - どの分岐で解釈したかを詳細にログ出力
+
+  ★ 集計の安定化
+    - radio の未確定時は統計を読まない（既定 0 を与えない）
+    - DurationSec が短すぎる（<30s）場合はファイル時刻などで補正、最終的に 900s へフォールバック
+    - SafeRate: /s 換算が 100,000/s 超になる異常値は無効化（空欄）しログ出力
 #>
 
 [CmdletBinding()]
@@ -140,7 +145,7 @@ function Normalize-WS { param([string]$s)
   return $s
 }
 
-# ===== AP名クレンジング（省略：前版と同じ） =====
+# ===== AP名クレンジング =====
 function Is-BadAPToken { param([string]$tok)
   if ([string]::IsNullOrWhiteSpace($tok)) { return $true }
   $t=$tok.ToLower()
@@ -179,8 +184,8 @@ function TryExtractPercentTriplet {
   param([string]$Line,[ref]$Busy1s,[ref]$Busy4s,[ref]$Busy64s)
   $ok=$false
   $m1=[regex]::Match($Line,'\b1s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m1.Success){ $Busy1s.Value=[double]$m1.Groups[1].Value; $ok=$true }
-  $m4=[regex]::Match($Line,'\b4s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m4.Success){ $Busy4s.Value=[double]$m4.Groups[1].Value; $ok=$true }
-  $m64=[regex]::Match($Line,'\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $Busy64s.Value=[double]$m64.Groups[1].Value; $ok=$true }
+  $m4=[regex]::Match($Line,'\b4s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m4.Success){ $Busy4s.Value=[double]$m4.Groups[2].Value; $ok=$true }
+  $m64=[regex]::Match($Line,'\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $Busy64s.Value=[double]$m64.Groups[3].Value; $ok=$true }
   if ($ok) { return $true }
   $m=[regex]::Match($Line,'1s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}4s[^0-9]{0,5}(\d+(?:\.\d+)?).{0,12}64s[^0-9]{0,5}(\d+(?:\.\d+)?)')
   if ($m.Success) { $Busy1s.Value=[double]$m.Groups[1].Value; $Busy4s.Value=[double]$m.Groups[2].Value; $Busy64s.Value=[double]$m.Groups[3].Value; return $true }
@@ -313,7 +318,7 @@ function Is-RadioStatsLines { param([string[]]$Lines)
   return $false
 }
 
-# ===== AP名 推定（ログあり） =====
+# ===== AP名 推定 =====
 function Guess-APName { param([string[]]$Lines,[string]$Path)
   Write-Log ("AP Guess: start path='{0}'" -f $Path)
   foreach ($raw in $Lines) {
@@ -355,7 +360,7 @@ function Fix-AP-From-Backup { param([string]$ap,[string]$path,[hashtable]$Backup
   return $ap
 }
 
-# ===== Band/Channel 補助（省略：前版と同じ） =====
+# ===== Band/Channel 補助 =====
 function Get-BandFromChannel { param([Nullable[int]]$Channel)
   if ($Channel -eq $null) { return '' }
   $ch=[int]$Channel
@@ -395,7 +400,7 @@ function Update-Backup { param([hashtable]$Backup,[string]$ap,[string]$band,[Nul
   elseif ($band -eq '6GHz')   { if ($slot.T6  -eq $null -or ($ts -ne $null -and $ts -gt $slot.T6 )) { $slot.Ch6 =[int]$ch; $slot.T6 =$ts; Write-Log ("Backup Update: AP='{0}' Band=6GHz Ch={1} ts={2}"  -f $ap,$ch,$ts) } }
 }
 
-# ===== バックアップパーサ（省略：前版と同） =====
+# ===== バックアップパーサ =====
 function Parse-BssTable-File { param([string]$Path,[hashtable]$Backup)
   Write-Log ("Backup Parse: BSS-Table '{0}'" -f $Path)
   $ts=$null; try{ $ts=[System.IO.File]::GetLastWriteTime($Path) }catch{}
@@ -540,7 +545,7 @@ function Parse-RadioStatsFile {
   $otUtc   = Extract-OutputTime -Lines $lines -Path $Path
   $apName  = Guess-APName -Lines $lines -Path $Path
 
-  $data=@{}; $currentRadio=''
+  $data=@{}; $currentRadio=$null; $seenAnyRadio=$false
   $ensure = {
     param([string]$r)
     $rk = ($apName + '|' + $r)
@@ -562,15 +567,21 @@ function Parse-RadioStatsFile {
 
   foreach ($raw in $lines) {
     $line=($raw -replace '\r','').Trim(); if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    if ($line -match '(?i)show\s+ap\s+debug\s+radio-stats\s+([012])\b') { $currentRadio=$Matches[1] }
-    elseif ($line -match '(?i)\bradio\s*([012])\b') { $currentRadio=$Matches[1] }
-    if ([string]::IsNullOrWhiteSpace($currentRadio)) {
-      $leaf=$null; try{ $leaf=Split-Path -Path $Path -Leaf }catch{}
-      if (-not [string]::IsNullOrWhiteSpace($leaf)) { $mfn=[regex]::Match($leaf,'(?i)\b([012])\b'); if($mfn.Success){ $currentRadio=$mfn.Groups[1].Value } }
-    }
-    if ([string]::IsNullOrWhiteSpace($currentRadio)) { $currentRadio='0' }
+
+    # --- ラジオ切替検出 ---
+    $switched = $false
+    if ($line -match '(?i)show\s+ap\s+debug\s+radio-stats\s+([012])\b') { $currentRadio=$Matches[1]; $switched=$true }
+    elseif ($line -match '(?i)^\s*radio\s*([012])\b')                  { $currentRadio=$Matches[1]; $switched=$true }
+    elseif ($line -match '(?i)\binterface\s*[:=]\s*wifi([01])\b')      { $currentRadio=$Matches[1]; $switched=$true }
+    elseif ($line -match '(?i)\bRadio\s*([012])\b')                     { $currentRadio=$Matches[1]; $switched=$true }
+    if ($switched) { $seenAnyRadio = $true; Write-Log ("Parse-RadioStatsFile: switch -> Radio {0}" -f $currentRadio) }
+
+    # 未確定の間は統計を読まない
+    if ([string]::IsNullOrWhiteSpace($currentRadio)) { continue }
+
     $obj = & $ensure $currentRadio
 
+    # --- Channel（本文直接）: Channel Changes を除外
     if ($line -notmatch '(?i)Channel\s+Changes') {
       $mCh1=[regex]::Match($line,'(?i)\bCurrent\s*Channel\s*[:=]\s*(\d{1,3})\b')
       $mCh2=[regex]::Match($line,'(?i)\bChannel\s*[:=]\s*(\d{1,3})\b')
@@ -582,6 +593,7 @@ function Parse-RadioStatsFile {
       }
     }
 
+    # --- Counters / Busy / Beacon / CCA 抽出
     if ($line -match '(?i)\bRx\s*retry\s*frames?\b')  { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxRetry=[double]$n } }
     if ($line -match '(?i)\bRx\s*CRC\s*Errors?\b')    { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxCRC  =[double]$n } }
     if ($line -match '(?i)\bRX\s*PLCP\s*Errors?\b')   { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxPLCP =[double]$n } }
@@ -600,7 +612,6 @@ function Parse-RadioStatsFile {
         $m64=[regex]::Match($line,'(?i)\b64s\b[^0-9\-]*(-?\d+(?:\.\d+)?)(?:\s*%)?'); if($m64.Success){ $obj.Busy64s=[double]$m64.Groups[1].Value }
       }
     }
-
     if ($line -match '(?i)\bBusy\s*\(?\s*Beacon\s*\)?') { $n=Get-LastNumber $line; if($n -ne $null){ $obj.BusyBeacon=[double]$n } }
     if ($line -match '(?i)\bTx\s*Beacon\b')             { $n=Get-LastNumber $line; if($n -ne $null){ $obj.TxBeacon=[double]$n } }
     if ($line -match '(?i)\bRx\s*Beacon\b')             { $n=Get-LastNumber $line; if($n -ne $null){ $obj.RxBeacon=[double]$n } }
@@ -619,6 +630,13 @@ function Parse-RadioStatsFile {
         }
       }
     }
+  }
+
+  if (-not $seenAnyRadio) {
+    $leaf=$null; try{ $leaf=Split-Path -Path $Path -Leaf }catch{}
+    $guess=$null; if ($leaf -and ($leaf -match '\b([012])\b')) { $guess=$Matches[1] } else { $guess='0' }
+    [void] & $ensure $guess
+    Write-Log ("Parse-RadioStatsFile: no radio markers; created empty slot radio={0}" -f $guess)
   }
 
   Write-Log ("Parse-RadioStatsFile: Path='{0}' OutputTimeUTC={1}" -f $Path, (ToLogStr-DT $otUtc "utc"))
@@ -654,6 +672,42 @@ function Expand-SnapshotInputs { param([string[]]$Inputs)
   return $out
 }
 
+# ===== 期間補正 =====
+function Fix-Duration {
+  param([Nullable[datetime]]$bt,[Nullable[datetime]]$at,[string]$bPath,[string]$aPath)
+  $sec=0
+  if ($bt -ne $null -and $at -ne $null) {
+    try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 }
+  }
+  if ($sec -lt 30) {
+    try {
+      $t1=[System.IO.File]::GetLastWriteTime($bPath)
+      $t2=[System.IO.File]::GetLastWriteTime($aPath)
+      $sec2=[int]([Math]::Abs(($t2 - $t1).TotalSeconds))
+      if ($sec2 -ge 30) { Write-Log ("Duration fix: using filetime {0}s (b={1} a={2})" -f $sec2,$t1,$t2); return $sec2 }
+    } catch {}
+    $sec=900
+    Write-Log ("Duration fix: too small; fallback to default 900s")
+  }
+  return $sec
+}
+
+# ===== 安全なレート算出 =====
+function SafeRate {
+  param([Nullable[double]]$After,[Nullable[double]]$Before,[int]$Dur,[string]$Label,[string]$AP,[string]$Radio)
+  if ($After -eq $null -or $Before -eq $null) { return $null }
+  if ($Dur -le 0) { return $null }
+  $diff = $After - $Before
+  if ($diff -lt 0) { $diff = 0.0 }
+  $rate = $diff / [double]$Dur
+  Write-Log ("RateCalc: {0} AP='{1}' R={2} before={3} after={4} dur={5}s rate={6}" -f $Label,$AP,$Radio,$Before,$After,$Dur,$rate)
+  if ($rate -gt 100000) {
+    Write-Log ("RateCalc WARN: absurd {0} -> drop (>{1}/s)" -f $Label,100000)
+    return $null
+  }
+  return [Math]::Round($rate,6)
+}
+
 # ===== ここから処理開始 =====
 Init-Log -Preferred $LogFile -OutputHtmlPath $OutputHtml -OutputCsvPath $OutputCsv
 Write-Log "=== START ==="
@@ -684,13 +738,9 @@ if ($SnapshotFiles -and $SnapshotFiles.Count -ge 1) {
 
   for ($i=0; $i -lt $sorted.Count-1; $i++) {
     $b=$sorted[$i]; $a=$sorted[$i+1]
-    $bt=$b.OutputTime; $at=$a.OutputTime
-    $sec=0
-    if ($bt -ne $null -and $at -ne $null) { try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 } }
-    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($b.Path); $t2=[System.IO.File]::GetLastWriteTime($a.Path); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) ; Write-Log ("Duration fallback by filetime sec={0} (b={1} a={2})" -f $sec,$t1,$t2)} catch { $sec=0 } }
-    if ($sec -le 0) { $sec=900; Write-Log "Duration fallback to default 900s" }
-    $sj = Convert-ToJst -dt $bt -Context ("seg{0}-startUtc" -f $i)
-    $ej = Convert-ToJst -dt $at -Context ("seg{0}-endUtc"   -f $i)
+    $sec = Fix-Duration -bt $b.OutputTime -at $a.OutputTime -bPath $b.Path -aPath $a.Path
+    $sj = Convert-ToJst -dt $b.OutputTime -Context ("seg{0}-startUtc" -f $i)
+    $ej = Convert-ToJst -dt $a.OutputTime -Context ("seg{0}-endUtc"   -f $i)
     $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=$sj; EndJst=$ej })
     Write-Log ("Segment[{0}] durSec={1} StartJST={2} EndJST={3}" -f $i,$sec,$sj,$ej)
   }
@@ -699,19 +749,15 @@ elseif (-not [string]::IsNullOrWhiteSpace($BeforeFile) -and -not [string]::IsNul
   $b = Parse-RadioStatsFile -Path $BeforeFile
   $a = Parse-RadioStatsFile -Path $AfterFile
   if (-not $b.IsRadio -or -not $a.IsRadio) { throw "指定ファイルが radio-stats 形式ではありません。radio-stats 出力を指定してください。" }
-  $bt=$b.OutputTime; $at=$a.OutputTime
   $allInputFiles = @($BeforeFile,$AfterFile)
+
   if ($DurationSec -le 0) {
-    $sec=0
-    if ($bt -ne $null -and $at -ne $null) { try { $sec=[int][Math]::Abs(($at - $bt).TotalSeconds) } catch { $sec=0 } }
-    if ($sec -le 0) { try { $t1=[System.IO.File]::GetLastWriteTime($BeforeFile); $t2=[System.IO.File]::GetLastWriteTime($AfterFile); $sec=[int]([Math]::Abs(($t2 - $t1).TotalSeconds)) ; Write-Log ("Duration fallback by filetime sec={0} (b={1} a={2})" -f $sec,$t1,$t2)} catch { $sec=0 } }
-    if ($sec -le 0) { $sec=900; Write-Log "Duration fallback to default 900s" }
-    $DurationSec=$sec
-  } else { $sec=$DurationSec }
-  $sj = Convert-ToJst -dt $bt -Context "single-startUtc"
-  $ej = Convert-ToJst -dt $at -Context "single-endUtc"
-  $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$sec; StartJst=$sj; EndJst=$ej })
-  Write-Log ("Single durSec={0} StartJST={1} EndJST={2}" -f $sec,$sj,$ej)
+    $DurationSec = Fix-Duration -bt $b.OutputTime -at $a.OutputTime -bPath $BeforeFile -aPath $AfterFile
+  }
+  $sj = Convert-ToJst -dt $b.OutputTime -Context "single-startUtc"
+  $ej = Convert-ToJst -dt $a.OutputTime -Context "single-endUtc"
+  $segments += (New-Object psobject -Property @{ Before=$b; After=$a; DurationSec=$DurationSec; StartJst=$sj; EndJst=$ej })
+  Write-Log ("Single durSec={0} StartJST={1} EndJST={2}" -f $DurationSec,$sj,$ej)
 }
 else {
   throw "単区間比較は -BeforeFile/-AfterFile、時系列集計は -SnapshotFiles に（フォルダ/ワイルドカード/ファイルのいずれかを）1個以上指定してください（展開後2つ以上の radio-stats ファイルが必要）。"
@@ -799,7 +845,7 @@ function Make-Diagnosis {
   $labels=@('co','inter','qual','busy')
   $scores=@($scoreCoch,$scoreInter,$scoreQual,$scoreBusy)
   $power =@($pCoch,$pInter,$pQual,$pBusy)
-  $maxIdx=0; for($i=1;$i -lt $scores.Length;$i++){ if($scores[$i] -gt $scores[$maxIdx] -or ($scores[$i] -eq $scores[$maxIdx] -and $power[$i] -gt $power[$maxIdx])){ $maxIdx=$i } }
+  $maxIdx=0; for($i=1;$i -lt $scores.Length;$i++){ if($scores[$i] -gt $scores[$maxIdx] -or ($scores[$i] -eq $scores[$maxIdx] -and $power[$i] -gt $power[$i])){ $maxIdx=$i } }
   $root=$labels[$maxIdx]
 
   $simple='';$why='';$tips='';$sev='sev-ok'
@@ -897,18 +943,14 @@ foreach ($seg in $segments) {
     $ap = Fix-AP-From-Backup -ap $ap -path $seg.After.Path -Backup $BackupMap
     if ($origAp -ne $ap) { Write-Log ("Row: AP fixed '{0}' -> '{1}'" -f $origAp,$ap) }
 
-    $dRetry = Diff-NonNegative $a.RxRetry $b.RxRetry
-    $dCRC   = Diff-NonNegative $a.RxCRC   $b.RxCRC
-    $dPLCP  = Diff-NonNegative $a.RxPLCP  $b.RxPLCP
-    $dChg   = Diff-NonNegative $a.ChannelChanges $b.ChannelChanges
-    $dTxPw  = Diff-NonNegative $a.TxPowerChanges $b.TxPowerChanges
-
-    $retry_ps=$null;$crc_ps=$null;$plcp_ps=$null;$chg_ph=$null;$txp_ph=$null
-    if ($dRetry -ne $null) { $retry_ps=[Math]::Round($dRetry/$dur,6) }
-    if ($dCRC   -ne $null) { $crc_ps  =[Math]::Round($dCRC  /$dur,6) }
-    if ($dPLCP  -ne $null) { $plcp_ps =[Math]::Round($dPLCP /$dur,6) }
-    if ($dChg   -ne $null) { $chg_ph  =[Math]::Round(($dChg*3600.0)/$dur,6) }
-    if ($dTxPw  -ne $null) { $txp_ph  =[Math]::Round(($dTxPw*3600.0)/$dur,6) }
+    # ---- レート（SafeRate）
+    $retry_ps = SafeRate -After $a.RxRetry -Before $b.RxRetry -Dur $dur -Label "RxRetry" -AP $ap -Radio $radio
+    $crc_ps   = SafeRate -After $a.RxCRC   -Before $b.RxCRC   -Dur $dur -Label "RxCRC"   -AP $ap -Radio $radio
+    $plcp_ps  = SafeRate -After $a.RxPLCP  -Before $b.RxPLCP  -Dur $dur -Label "RxPLCP"  -AP $ap -Radio $radio
+    $chg_s    = SafeRate -After $a.ChannelChanges -Before $b.ChannelChanges -Dur $dur -Label "ChannelChanges" -AP $ap -Radio $radio
+    $txp_s    = SafeRate -After $a.TxPowerChanges -Before $b.TxPowerChanges -Dur $dur -Label "TxPowerChanges" -AP $ap -Radio $radio
+    $chg_ph=$null; if ($chg_s -ne $null){ $chg_ph=[Math]::Round($chg_s*3600,6) }
+    $txp_ph=$null; if ($txp_s -ne $null){ $txp_ph=[Math]::Round($txp_s*3600,6) }
 
     function Pick-AfterFirst { param($afterV,$beforeV) if ($afterV -ne $null) { return $afterV } return $beforeV }
     $busy1s = Pick-AfterFirst $a.Busy1s $b.Busy1s
@@ -1000,7 +1042,7 @@ foreach ($seg in $segments) {
 
 Write-Output ("CSV : {0}" -f $OutputCsv)
 
-# ===== HTML（省略せず） =====
+# ===== HTML =====
 if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
   $baseRef=$OutputHtml
   $outDir=Get-ParentOrCwd -PathLike $baseRef
