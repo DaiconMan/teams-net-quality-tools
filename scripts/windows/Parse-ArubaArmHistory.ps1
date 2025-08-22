@@ -58,7 +58,7 @@ function Detect-ChangeType { param([string]$line)
 
 function Extract-Reason { param([string]$line)
   $m = [regex]::Match($line, '(?i)reason\s*[:=]\s*([^\]\)]+)'); if ($m.Success) { return ($m.Groups[1].Value.Trim()) }
-  $m2 = [regex]::Match($line, '(?i)[$begin:math:text$\\[]\\s*reason\\s+([^\\]$end:math:text$]+)[\)\]]'); if ($m2.Success) { return ($m2.Groups[1].Value.Trim()) }
+  $m2 = [regex]::Match($line, '(?i)[\(\[]\s*reason\s+([^\]\)]+)[\)\]]'); if ($m2.Success) { return ($m2.Groups[1].Value.Trim()) }
   $candidates = @('interference','noise','load','dfs','coverage','utilization','error','roaming')
   foreach ($c in $candidates) { if ($line -match ("(?i)\b{0}\b" -f [regex]::Escape($c))) { return $c } }
   return 'Unknown'
@@ -77,7 +77,7 @@ foreach ($p in $InputFiles) {
   if (-not $matches) {
     $dir = Split-Path -LiteralPath $p -Parent; if ([string]::IsNullOrWhiteSpace($dir)) { $dir='.' }
     $name = Split-Path -LiteralPath $p -Leaf
-    $matches = Get-ChildItem -File -Path (Join-Path -LiteralPath $dir -ChildPath $name) -ErrorAction SilentlyContinue
+    $matches = Get-ChildItem -File -Path (Join-Path -Path $dir -ChildPath $name) -ErrorAction SilentlyContinue
   }
   if ($matches) { $inputs += $matches }
 }
@@ -87,8 +87,8 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Split-Path -Literal
 Ensure-Dir -Path $OutputDir
 
 $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-$summaryCsv = Join-Path -LiteralPath $OutputDir -ChildPath ("arm_history_summary_{0}.csv" -f $ts)
-$eventsCsv  = Join-Path -LiteralPath $OutputDir -ChildPath ("arm_history_events_{0}.csv"  -f $ts)
+$summaryCsv = Join-Path -Path $OutputDir -ChildPath ("arm_history_summary_{0}.csv" -f $ts)
+$eventsCsv  = Join-Path -Path $OutputDir -ChildPath ("arm_history_events_{0}.csv"  -f $ts)
 
 Set-Content -LiteralPath $summaryCsv -Value 'AP,ChangeType,Reason,Count' -Encoding UTF8
 Set-Content -LiteralPath $eventsCsv  -Value 'AP,Timestamp,ChangeType,Reason,RawLine' -Encoding UTF8
@@ -145,6 +145,7 @@ Write-Output ("Events  CSV: {0}" -f $eventsCsv)
 # ---- HTML 出力（任意） ----
 if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
   $outDir = Split-Path -LiteralPath $OutputHtml -Parent
+  if ([string]::IsNullOrWhiteSpace($outDir)) { $outDir = (Get-Location).Path }
   if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
   $titleText = $Title

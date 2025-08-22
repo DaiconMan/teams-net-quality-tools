@@ -3,7 +3,7 @@
   Aruba "show ap debug radio-stats" の2スナップショットから差分/秒を計算しCSV/HTML出力。
 .DESCRIPTION
   - PowerShell 5.1 対応。三項演算子未使用。予約語 Host 不使用。
-  - OneDrive/日本語/スペースを考慮（Join-Path / -LiteralPath 使用）。Cドライブ固定参照なし。
+  - OneDrive/日本語/スペースを考慮（Join-Path / -LiteralPath 使用箇所はcmdlet側でのみ）。Cドライブ固定参照なし。
   - Before/After それぞれのテキスト出力を読み取り、以下を抽出:
       * Rx retry frames / RX CRC Errors / RX PLCP Errors（累積）
       * Channel Changes / TX Power Changes（累積）
@@ -44,7 +44,6 @@ function Get-ParentOrCwd {
     if (Test-Path -LiteralPath $PathLike) {
       try { $dir = Split-Path -LiteralPath $PathLike -Parent } catch { $dir = $null }
     } else {
-      # ファイルが未作成でも、パスにディレクトリ部分が含まれていれば拾う
       try { $dir = Split-Path -Path $PathLike -Parent } catch { $dir = $null }
     }
   }
@@ -54,7 +53,7 @@ function Get-ParentOrCwd {
   return $dir
 }
 
-#--- 文字列HTMLエスケープ（System.Web未依存）
+#--- 文字列HTMLエスケープ
 function HtmlEscape {
   param([string]$s)
   if ($null -eq $s) { return '' }
@@ -91,15 +90,11 @@ function TryExtractPercentTriplet {
 #--- "output time" を各種表記から抽出
 function Extract-OutputTime {
   param([string[]]$Lines)
-
   $dt = $null
-
   # 候補行
   $candidates = @()
   foreach ($raw in $Lines) {
-    if ($raw -match '(?i)(output\s*time|出力(時刻|時間|日時)|生成時刻)') {
-      $candidates += $raw
-    }
+    if ($raw -match '(?i)(output\s*time|出力(時刻|時間|日時)|生成時刻)') { $candidates += $raw }
   }
   if ($candidates.Count -eq 0) { return $null }
 
@@ -145,7 +140,6 @@ function Extract-OutputTime {
       try { return [DateTime]::Parse($s, [System.Globalization.CultureInfo]::GetCultureInfo('en-US')) } catch {}
     }
   }
-
   return $null
 }
 
@@ -173,10 +167,7 @@ function Parse-RadioStatsFile {
     if ($mr.Success) { $radio = $mr.Groups[1].Value }
 
     $mh = [regex]::Match($line, '(?i)AP\s+([^\s]+).*?Radio[^0-9]*([01])')
-    if ($mh.Success) {
-      $ap = $mh.Groups[1].Value
-      $radio = $mh.Groups[2].Value
-    }
+    if ($mh.Success) { $ap = $mh.Groups[1].Value; $radio = $mh.Groups[2].Value }
 
     # キー
     $key = ''
@@ -269,7 +260,7 @@ if ($DurationSec -le 0) {
 if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
   $outDir = Get-ParentOrCwd -PathLike $AfterFile
   $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-  $OutputCsv = Join-Path -LiteralPath $outDir -ChildPath ("aruba_radio_stats_diff_{0}.csv" -f $ts)
+  $OutputCsv = Join-Path -Path $outDir -ChildPath ("aruba_radio_stats_diff_{0}.csv" -f $ts)
 }
 
 # ヘッダ
@@ -364,7 +355,6 @@ foreach ($k in $keys) {
 # ---- HTML 出力（任意） ----
 if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
   $outDir = Get-ParentOrCwd -PathLike $OutputHtml
-  # Join-Pathはファイル名と同名ディレクトリ防止のため、ここでは outDir をそのまま使用
   if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
   $titleText = $Title
@@ -375,7 +365,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputHtml)) {
     $titleText = "Aruba Radio Stats Diff ($bt → $at)"
   }
 
-  # テーブルHTML組立（省略せず全出力）
+  # テーブルHTML組立
   $sb = New-Object System.Text.StringBuilder
   [void]$sb.AppendLine('<!DOCTYPE html>')
   [void]$sb.AppendLine('<meta charset="UTF-8">')
@@ -491,16 +481,14 @@ input[type="search"]{padding:6px 8px;width:280px;max-width:60%}
 })();
 </script>')
 
-  $html = $sb.ToString()
-
-  # OutputHtml がファイルパスの場合に備え、実ファイルパスを構成
-  $htmlPath = $OutputHtml
+  # 出力パスの安全構成
   $htmlDir  = Get-ParentOrCwd -PathLike $OutputHtml
   $nameOnly = $null
   try { $nameOnly = Split-Path -Path $OutputHtml -Leaf } catch { $nameOnly = $null }
   if ([string]::IsNullOrWhiteSpace($nameOnly)) { $nameOnly = "radio_stats_diff.html" }
-  $htmlPath = Join-Path -LiteralPath $htmlDir -ChildPath $nameOnly
+  $htmlPath = Join-Path -Path $htmlDir -ChildPath $nameOnly
 
+  $html = $sb.ToString()
   Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
   Write-Output ("HTML: {0}" -f $htmlPath)
 }
